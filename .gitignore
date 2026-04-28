@@ -21,6 +21,7 @@ MANIFEST
 # Environments
 # ====================
 .env
+.env.swanlab.local
 .venv
 venv/
 env/
