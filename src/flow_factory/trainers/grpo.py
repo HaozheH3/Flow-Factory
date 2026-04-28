@@ -115,6 +115,7 @@ class GRPOTrainer(BaseTrainer):
                     **self.eval_args,
                 }
                 inference_kwargs.update(**batch)
+                inference_kwargs = self._materialize_jsonl_images_for_adapter_inference(inference_kwargs)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
                 samples = self.adapter.inference(**inference_kwargs)
                 all_samples.extend(samples)
@@ -162,6 +163,7 @@ class GRPOTrainer(BaseTrainer):
                     'trajectory_indices': trajectory_indices, # Selectively store required trajectory positions for memory efficiency
                     **batch,
                 }
+                sample_kwargs = self._materialize_jsonl_images_for_adapter_inference(sample_kwargs)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)        
                 samples.extend(sample_batch)
@@ -397,6 +399,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                     'extra_call_back_kwargs': ['next_latents_mean'], # For GRPO-Guard, we need to store `next_latents_mean` for ratio normalization
                     **batch,
                 }
+                sample_kwargs = self._materialize_jsonl_images_for_adapter_inference(sample_kwargs)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)        
                 samples.extend(sample_batch)

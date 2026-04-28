@@ -640,6 +640,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # Callback arguments
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        # JSONL / dataset columns (see attach_per_sample_metadata_for_inference in dataset.py)
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> List[QwenImageEditPlusSample]:
         """Generate images using Qwen-Image-Edit Plus model."""
         # 1. Set up
@@ -827,6 +829,26 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
+
+        def _per_sample_extra_kwargs(sample_index: int) -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                **{k: v[sample_index] for k, v in extra_call_back_res.items()},
+                "callback_index_map": callback_index_map,
+            }
+            if metadata is not None:
+                if len(metadata) != batch_size:
+                    raise ValueError(
+                        f"metadata list length ({len(metadata)}) must match batch_size ({batch_size}); "
+                        "metadata comes from GeneralDataset (JSONL columns not in inference signature)."
+                    )
+                row = metadata[sample_index]
+                if not isinstance(row, dict):
+                    raise TypeError(
+                        f"metadata[{sample_index}] must be dict, got {type(row).__name__}: {row!r}"
+                    )
+                out = {**out, **row}
+            return out
+
         samples = [
             QwenImageEditPlusSample(
                 # Denoising trajectory
@@ -852,10 +874,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
                 negative_prompt_embeds_mask=negative_prompt_embeds_mask[b] if negative_prompt_embeds_mask is not None else None,
                 # Extra kwargs
-                extra_kwargs={
-                    **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
-                },
+                extra_kwargs=_per_sample_extra_kwargs(b),
             )
             for b in range(batch_size)
         ]
@@ -897,6 +916,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         auto_resize : bool = True,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Batch inference, the input must be in the batch format
@@ -909,6 +929,11 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             len(condition_images) if condition_images is not None else
             len(vae_images) if vae_images is not None else 1
         )
+        if metadata is not None and len(metadata) != batch_size:
+            raise ValueError(
+                f"metadata list length ({len(metadata)}) must match batch_size ({batch_size}); "
+                "metadata is produced from JSONL by attach_per_sample_metadata_for_inference."
+            )
 
         if batch_size > 1:
             raise ValueError(
@@ -952,6 +977,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 auto_resize=auto_resize,
                 trajectory_indices=trajectory_indices,
+                metadata=[metadata[b]] if metadata is not None else None,
             )
             all_samples.extend(sample)
 

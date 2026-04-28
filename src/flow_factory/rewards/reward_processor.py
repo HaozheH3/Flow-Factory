@@ -17,6 +17,7 @@
 Unified Reward Processor for handling multiple reward models.
 """
 from __future__ import annotations
+import logging
 from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
 from collections import defaultdict
 from contextlib import nullcontext
@@ -39,6 +40,13 @@ from ..utils.dist import gather_samples
 from ..utils.base import filter_kwargs
 from ..utils.image import standardize_image_batch
 from ..utils.video import standardize_video_batch
+from .toolgen_searchbetter_judge_common import (
+    TOOLGEN_JUDGE_LABELED_SCORES_KEY,
+    TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE,
+    toolgen_mean_reward_drop_constant_dimensions,
+)
+
+logger = logging.getLogger(__name__)
 
 # ============================ Reward Processor ============================
 class RewardProcessor:
@@ -112,6 +120,90 @@ class RewardProcessor:
 
         return batch_size
 
+    def _apply_toolgen_group_drop_constant_dims(
+        self,
+        reward_name: str,
+        rewards: torch.Tensor,
+        samples: List[BaseSample],
+    ) -> torch.Tensor:
+        """
+        For ToolGen SearchBetter judges: recompute each sample's reward from per-dimension
+        scores, dropping dimensions that are identical across **successful** judge parses in
+        the same ``sample.unique_id`` group (zero cross-sample std on the native ``[0,3]`` scale).
+        Samples without labeled scores (judge/API/parse failure) are **excluded** from the std
+        computation; they receive the **mean** of the adjusted rewards of successful members in
+        that group so they sit at the group average (near-zero relative advantage vs group mean).
+        """
+        cfg = self.reward_configs.get(reward_name)
+        if cfg is None or not bool(
+            cfg.extra_kwargs.get("toolgen_group_drop_constant_score_dims", False)
+        ):
+            return rewards
+        eps = float(cfg.extra_kwargs.get("toolgen_group_constant_score_std_eps", 1e-6))
+        retain = bool(cfg.extra_kwargs.get("toolgen_retain_labeled_scores_in_samples", False))
+
+        uid_to_indices: Dict[int, List[int]] = defaultdict(list)
+        for i, s in enumerate(samples):
+            uid_to_indices[s.unique_id].append(i)
+
+        out = rewards.clone()
+        adjusted_groups = 0
+        for _uid, idxs in uid_to_indices.items():
+            if len(idxs) < 2:
+                continue
+            successful = [
+                i
+                for i in idxs
+                if samples[i].extra_kwargs.get(TOOLGEN_JUDGE_LABELED_SCORES_KEY) is not None
+            ]
+            failed = [i for i in idxs if i not in successful]
+            if not successful:
+                continue
+            vecs = [samples[i].extra_kwargs[TOOLGEN_JUDGE_LABELED_SCORES_KEY] for i in successful]
+            new_vals = toolgen_mean_reward_drop_constant_dimensions(vecs, eps=eps)
+            if self.verbose and self.accelerator.is_local_main_process:
+                old_t = rewards[successful].detach().cpu().float()
+                new_t = torch.tensor(new_vals, dtype=torch.float32)
+                old_mean = float(old_t.mean().item())
+                new_mean = float(new_t.mean().item())
+                old_std = float(old_t.std(unbiased=False).item())
+                new_std = float(new_t.std(unbiased=False).item())
+                logger.info(
+                    "Reward %r unique_id=%s toolgen_drop_constant_dims: "
+                    "mean %s->%s std %s->%s (n_success=%d, eps=%s)",
+                    reward_name,
+                    _uid,
+                    old_mean,
+                    new_mean,
+                    old_std,
+                    new_std,
+                    len(successful),
+                    eps,
+                )
+            mean_successful = sum(new_vals) / float(len(new_vals))
+            for j, i in enumerate(successful):
+                out[i] = float(new_vals[j])
+            for i in failed:
+                out[i] = float(mean_successful)
+            adjusted_groups += 1
+            if not retain:
+                for i in successful:
+                    vec = samples[i].extra_kwargs.get(TOOLGEN_JUDGE_LABELED_SCORES_KEY)
+                    if vec is not None:
+                        samples[i].extra_kwargs[TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE] = list(
+                            vec
+                        )
+                    samples[i].extra_kwargs.pop(TOOLGEN_JUDGE_LABELED_SCORES_KEY, None)
+
+        if adjusted_groups and self.verbose and self.accelerator.is_local_main_process:
+            logger.info(
+                "Reward %r: toolgen_group_drop_constant_score_dims adjusted %s prompt group(s), eps=%s",
+                reward_name,
+                adjusted_groups,
+                eps,
+            )
+        return out
+
     # ============================ Media Format Conversion ============================
     def _convert_media_format(self, batch_input: Dict[str, Any], model: BaseRewardModel) -> Dict[str, Any]:
         """Convert tensor media fields to PIL format (unless model opts out)."""
@@ -142,34 +234,95 @@ class RewardProcessor:
 
         return result
     
+    @staticmethod
+    def _sample_field_value(sample: BaseSample, key: str) -> Any:
+        """Resolve a reward input field; missing keys become None (not omitted)."""
+        try:
+            return sample[key]
+        except KeyError:
+            return None
+
+    def _combined_reward_kwarg_keys(self, model: BaseRewardModel, samples: List[BaseSample]) -> List[str]:
+        """Union of kwargs keys each sample would pass into ``model.__call__`` (via ``filter_kwargs``)."""
+        combined: Set[str] = set()
+        for s in samples:
+            filtered_one = filter_kwargs(model.__call__, **s.to_dict())
+            combined.update(filtered_one.keys())
+        required = tuple(getattr(model, "required_fields", ()) or ())
+        ordered = [k for k in required if k in combined]
+        ordered.extend(sorted(combined - set(ordered)))
+        return ordered
+
+    def _build_columns_for_reward_batch(
+        self,
+        *,
+        reward_name: str,
+        model: BaseRewardModel,
+        samples: List[BaseSample],
+    ) -> Dict[str, List[Any]]:
+        """
+        Build list-valued kwargs for one reward call.
+
+        Media fields are included only when every sample has a non-None value; mixed
+        None / non-None across a batch raises (cannot standardize partial media batches).
+
+        Non-media fields are always included when present in the combined key set so
+        per-sample None values reach the model (instead of dropping the kwarg entirely,
+        which incorrectly surfaced as "missing" on the whole batch).
+        """
+        keys = self._combined_reward_kwarg_keys(model, samples)
+        batch_input: Dict[str, List[Any]] = {}
+        for k in keys:
+            column = [self._sample_field_value(s, k) for s in samples]
+            if k in self.MEDIA_FIELDS:
+                any_non_none = any(v is not None for v in column)
+                all_non_none = all(v is not None for v in column)
+                if any_non_none and not all_non_none:
+                    bad_idx = [i for i, v in enumerate(column) if v is None]
+                    raise ValueError(
+                        f"reward {reward_name!r}: inconsistent None for media field {k!r} "
+                        f"(sample indices with None: {bad_idx})."
+                    )
+                if all_non_none:
+                    batch_input[k] = column
+            else:
+                batch_input[k] = column
+        return batch_input
+
     # ============================ Single-batch / Single-group Helpers ============================
     def _compute_pointwise_batch(
         self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
     ) -> torch.Tensor:
         """Compute pointwise rewards for a single batch. Returns (batch_size,) tensor."""
-        filtered_fields = filter_kwargs(model.__call__, **batch_samples[0])
-        batch_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in batch_samples]
-            for k in filtered_fields
-            if all(getattr(s, k) is not None for s in batch_samples)
-        }
+        batch_input = self._build_columns_for_reward_batch(
+            reward_name=name, model=model, samples=batch_samples
+        )
         batch_input = self._convert_media_format(batch_input, model)
         output = model(**batch_input)
-        return torch.as_tensor(
+        rewards_t = torch.as_tensor(
             output.rewards if hasattr(output, 'rewards') else output,
             device='cpu', dtype=torch.float32,
         )
+        extra = getattr(output, "extra_info", None) or {}
+        labeled_batch = extra.get("judge_labeled_scores_batch")
+        if labeled_batch is not None:
+            if len(labeled_batch) != len(batch_samples):
+                raise ValueError(
+                    f"reward {name!r}: judge_labeled_scores_batch length {len(labeled_batch)} "
+                    f"!= batch size {len(batch_samples)}"
+                )
+            for sample, vec in zip(batch_samples, labeled_batch):
+                if vec is not None:
+                    sample.extra_kwargs[TOOLGEN_JUDGE_LABELED_SCORES_KEY] = vec
+        return rewards_t
 
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]
     ) -> torch.Tensor:
         """Compute groupwise rewards for one complete group. Returns (group_size,) tensor."""
-        fields = filter_kwargs(model.__call__, **group_samples[0])
-        group_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in group_samples]
-            for k in fields
-            if all(getattr(s, k) is not None for s in group_samples)
-        }
+        group_input = self._build_columns_for_reward_batch(
+            reward_name=name, model=model, samples=group_samples
+        )
         group_input = self._convert_media_format(group_input, model)
         output = model(**group_input)
         return torch.as_tensor(
@@ -243,10 +396,20 @@ class RewardProcessor:
             )
             for i in pbar:
                 batch_samples = samples[i : i + batch_size]
+                end = min(i + batch_size, len(samples))
+                logger.info(
+                    "Pointwise reward %r: processing samples [%s, %s) of %s (micro-batch size %s)",
+                    name,
+                    i,
+                    end,
+                    len(samples),
+                    batch_size,
+                )
                 reward_tensor = self._compute_pointwise_batch(name, model, batch_samples)
                 rewards.append(reward_tensor)
             
-            results[name] = torch.cat(rewards, dim=0)
+            stacked = torch.cat(rewards, dim=0)
+            results[name] = self._apply_toolgen_group_drop_constant_dims(name, stacked, samples)
         
         return results
 
@@ -308,12 +471,9 @@ class RewardProcessor:
                 uid = group_keys[group_idx]
                 group_list = groups[uid]
 
-                fields = filter_kwargs(model.__call__, **group_list[0])
-                group_input = {
-                    k: [getattr(s, k) for s in group_list]
-                    for k in fields
-                    if all(getattr(s, k) is not None for s in group_list)
-                }
+                group_input = self._build_columns_for_reward_batch(
+                    reward_name=name, model=model, samples=group_list
+                )
                 group_input = self._convert_media_format(group_input, model)
 
                 output = model(**group_input)
@@ -395,13 +555,9 @@ class RewardProcessor:
                 uid = group_keys[group_idx]
                 group_list = groups[uid]
 
-                # Prepare group input
-                fields = filter_kwargs(model.__call__, **group_list[0])
-                group_input = {
-                    k: [getattr(s, k) for s in group_list]
-                    for k in fields
-                    if all(getattr(s, k) is not None for s in group_list)
-                }
+                group_input = self._build_columns_for_reward_batch(
+                    reward_name=name, model=model, samples=group_list
+                )
                 group_input = self._convert_media_format(group_input, model)
 
                 # Compute rewards
@@ -796,5 +952,8 @@ class RewardBuffer:
             assert all(r is not None for r in reward_list), (
                 f"Missing rewards for async model '{name}'"
             )
-            results[name] = torch.stack(reward_list)
+            stacked = torch.stack(reward_list)
+            results[name] = self.rp._apply_toolgen_group_drop_constant_dims(
+                name, stacked, self.all_samples
+            )
         return results

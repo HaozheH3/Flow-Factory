@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-TIGER-Lab/RationalRewards-8B-T2I}"
+MODEL_PATH="${MODEL_PATH:-/primus_xpfs_workspace_T04/haozhe/aaRationalRewards/models/rr-8b-t2i}"
 
 if [[ -n "${SERVED_MODEL_NAME:-}" ]]; then
   :

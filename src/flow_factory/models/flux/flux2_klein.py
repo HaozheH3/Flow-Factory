@@ -403,6 +403,7 @@ class Flux2KleinAdapter(BaseAdapter):
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Flux2KleinSample]:
         
         device = self.device
@@ -539,6 +540,26 @@ class Flux2KleinAdapter(BaseAdapter):
         latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
+
+        def _per_sample_extra_kwargs(sample_index: int) -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                **{k: v[sample_index] for k, v in extra_call_back_res.items()},
+                "callback_index_map": callback_index_map,
+            }
+            if metadata is not None:
+                if len(metadata) != batch_size:
+                    raise ValueError(
+                        f"metadata list length ({len(metadata)}) must match batch_size ({batch_size}); "
+                        "metadata comes from GeneralDataset (JSONL columns not in PREPROCESS_KEYS)."
+                    )
+                row = metadata[sample_index]
+                if not isinstance(row, dict):
+                    raise TypeError(
+                        f"metadata[{sample_index}] must be dict, got {type(row).__name__}: {row!r}"
+                    )
+                out = {**out, **row}
+            return out
+
         samples = [
             Flux2KleinSample(
                 # Denoising trajectory
@@ -566,11 +587,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 condition_images=condition_images[b] if condition_images is not None else None,
                 image_latents=image_latents[b] if image_latents is not None else None,
                 image_latent_ids=image_latent_ids[b] if image_latent_ids is not None else None,
-                # Extra kwargs
-                extra_kwargs={
-                    **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
-                },
+                extra_kwargs=_per_sample_extra_kwargs(b),
             )
             for b in range(batch_size)
         ]
@@ -611,6 +628,7 @@ class Flux2KleinAdapter(BaseAdapter):
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Flux2KleinSample]:
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -655,6 +673,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 compute_log_prob=compute_log_prob,
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 trajectory_indices=trajectory_indices,
+                metadata=metadata,
             )
         
         # Ragged case: per-sample fallback
@@ -685,6 +704,7 @@ class Flux2KleinAdapter(BaseAdapter):
             this_image_latents=image_latents[idx].unsqueeze(0) if image_latents is not None else None
             this_image_latent_ids=image_latent_ids[idx].unsqueeze(0) if image_latent_ids is not None else None
             # Inference for one sample
+            this_meta = [metadata[idx]] if metadata is not None else None
             sample = self._inference(
                 # Ordinary args
                 images=this_images,
@@ -714,6 +734,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 compute_log_prob=compute_log_prob,
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 trajectory_indices=trajectory_indices,
+                metadata=this_meta,
             )
             samples.extend(sample)
 

@@ -1,0 +1,127 @@
+# Recommended FLUX.2 Klein + ToolGen SearchBetter judge (Frontier) config.
+# Combines the frontier example with patterns from qwen1_rationalrewards.yaml:
+# - Logging keys live under `log:` (Flow-Factory `Arguments.from_dict` nested_map).
+# - `eval_rewards` mirrors training rewards for eval-time scoring (variant + stricter temperature).
+# - `eval.eval_freq` matches rational-rewards style frequent checkpoints (10 vs 20).
+# - `data.enable_preprocess` set explicitly (default is true; documents intent).
+# Dataset / ToolGen paths: edit `data.dataset_dir`, `toolgen_phase4_agent_dir`, and Frontier auth env vars.
+# Optional reward shaping: `toolgen_judge_major_aspect_weights` renormalizes weights across major judge
+# terms (adaptive rubric block, checklist block, each generic rubric dim, reference scores). Omitted keys default to 1.0.
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/dataset/klein_i2i_visual_ge_35_v2"
+  enable_preprocess: false
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/cached_datasets2"
+  max_dataset_size: 10240
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "/primus_xpfs_workspace_T04/haozhe/gen_models/black-forest-labs/flux2-klein-4b-base"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "swanlab"
+  save_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/modeloutputs"
+  save_freq: 10
+  save_model_only: true
+
+train:
+  nft_query_group_loss_mask: true
+  nft_query_group_loss_mask_high_reward_threshold: 0.86
+  nft_query_group_loss_mask_low_std_threshold: 0.05
+  trainer_type: "nft"
+  advantage_aggregation: "gdpo"
+  nft_beta: 1.0
+  off_policy: true
+  ema_decay_schedule: "piecewise_linear"
+  flat_steps: 0
+  ramp_rate: 0.001
+  ema_decay: 0.5
+  ema_update_interval: 1
+  ema_device: "cuda"
+  num_train_timesteps: 10
+  time_sampling_strategy: "discrete"
+  time_shift: 3.0
+  timestep_range: 0.5 # changed from 0.5
+  kl_type: "v-based"
+  kl_beta: 0.002
+  ref_param_device: "cuda"
+  adv_clip_range: 5.0
+  resolution: 512
+  condition_image_size: 512
+  num_inference_steps: 32
+  guidance_scale: 4.0
+  per_device_batch_size: 1
+  group_size: 8
+  global_std: false
+  unique_sample_num_per_epoch: 32
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: auto
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  enable_gradient_checkpointing: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+
+eval:
+  resolution: 512
+  condition_image_size: 512
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 40
+  eval_freq: 10
+  seed: 42
+
+rewards:
+  - name: "toolgen_searchbetter_judge_frontier"
+    reward_model: "toolgen_searchbetter_judge_frontier"
+    batch_size: 16
+    device: "cpu"
+    dtype: bfloat16
+    toolgen_phase4_agent_dir: "/primus_xpfs_workspace_T04/haozhe/ToolGen/phase4_agent"
+    frontier_model_name: "doubao-seed-2.0-mini"
+    max_concurrent: 16
+    max_retries: 3
+    temperature: 0.2
+    max_tokens: 8000
+    max_pixels: 589824
+    frontier_max_total_pixels: 589824
+    variant: "training"
+    frontier_api_timeout: 300
+    frontier_judge_dump_dir: /primus_xpfs_workspace_T04/haozhe/Flow-Factory/.runtime_cache/frontier_judge_dumps_4b_gemini
+    toolgen_judge_unparsed_dump_dir: /primus_xpfs_workspace_T04/haozhe/Flow-Factory/.runtime_cache/frontier_judge_dumps_4b_new_error
+    frontier_judge_error_policy: penalize
+    frontier_judge_penalty_value: 0.0
+    # Optional: per-major-term weights (renormalized to sum 1). Omit keys to use weight 1.0.
+    toolgen_judge_major_aspect_weights:
+      rubric_adaptive: 1.5
+      checklist: 1.5
+      prompt_faithfulness: 1.5
+      image_quality: 1.0
+      text_rendering: 2.5
+      ai_naturalness: 1.0
+      composition_and_aesthetics: 1.0
+      visual_reference_evaluation: 2.0
+      text_reference_evaluation: 1.0
+

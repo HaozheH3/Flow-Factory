@@ -20,7 +20,7 @@ Reference:
     - https://arxiv.org/abs/2509.16117
 """
 import os
-from typing import List, Dict, Any, Union, Optional
+from typing import List, Dict, Any, Union, Optional, Tuple
 from functools import partial
 from collections import defaultdict
 from contextlib import nullcontext, contextmanager
@@ -43,10 +43,71 @@ from ..utils.dist import reduce_loss_info
 logger = setup_logger(__name__)
 
 
+def compute_nft_query_group_loss_keep_mask_global(
+    aggregated_rewards: np.ndarray,
+    gathered_ids: np.ndarray,
+    *,
+    high_reward_threshold: float,
+    low_std_threshold: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Build a global per-sample keep mask (1 = keep loss, 0 = mask) from reward vectors and group ids.
+
+    A group is masked when ``mean(reward in group) > high_reward_threshold`` and
+    ``std(reward in group) < low_std_threshold``. If every sample would be masked, the mask is
+    reset to all ones so optimization does not degenerate.
+
+    Returns:
+        ``(keep_mask_global, stats)`` where ``keep_mask_global`` has the same shape as
+        ``aggregated_rewards``, and ``stats`` contains counts for logging.
+    """
+    if aggregated_rewards.shape != gathered_ids.shape:
+        raise ValueError(
+            f"aggregated_rewards shape {aggregated_rewards.shape} must match gathered_ids "
+            f"{gathered_ids.shape}"
+        )
+    group_keys, group_indices = np.unique(gathered_ids, return_inverse=True)
+    keep_mask_global = np.ones_like(aggregated_rewards, dtype=np.float32)
+    filtered_group_count = 0
+    num_groups = int(len(group_keys))
+    for group_id in range(num_groups):
+        group_mask = group_indices == group_id
+        group_rewards = aggregated_rewards[group_mask]
+        group_mean = float(np.mean(group_rewards))
+        group_std = float(np.std(group_rewards))
+        if group_mean > high_reward_threshold and group_std < low_std_threshold:
+            keep_mask_global[group_mask] = 0.0
+            filtered_group_count += 1
+
+    total_samples = int(keep_mask_global.shape[0])
+    filtered_samples = int((keep_mask_global == 0.0).sum())
+    total_groups = num_groups
+    reset_all = False
+    if filtered_samples == total_samples:
+        keep_mask_global[:] = 1.0
+        filtered_samples = 0
+        filtered_group_count = 0
+        reset_all = True
+
+    stats: Dict[str, Any] = {
+        "filtered_samples": filtered_samples,
+        "total_samples": total_samples,
+        "filtered_groups": filtered_group_count,
+        "total_groups": total_groups,
+        "reset_all": reset_all,
+    }
+    return keep_mask_global, stats
+
 
 class DiffusionNFTTrainer(BaseTrainer):
     """
     DiffusionNFT Trainer with off-policy and continuous timestep support.
+
+    Optional **query-group loss mask** (``nft_query_group_loss_mask`` in :class:`~flow_factory.hparams.NFTTrainingArguments`):
+    skip NFT (and KL) loss on samples whose ``unique_id`` group has very high mean reward and very
+    low cross-sample reward variance, after aggregating multi-reward outputs with model weights and
+    gathering across distributed ranks.
+
     Reference: https://arxiv.org/abs/2509.16117
     """
 
@@ -154,6 +215,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                     **self.eval_args,
                 }
                 inference_kwargs.update(**batch)
+                inference_kwargs = self._materialize_jsonl_images_for_adapter_inference(inference_kwargs)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
                 samples = self.adapter.inference(**inference_kwargs)
                 all_samples.extend(samples)
@@ -258,6 +320,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                     'trajectory_indices': [-1], # For NFT, only keep the final latents
                     **batch
                 }
+                sample_kwargs = self._materialize_jsonl_images_for_adapter_inference(sample_kwargs)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
                 samples.extend(sample_batch)
@@ -304,6 +367,122 @@ class DiffusionNFTTrainer(BaseTrainer):
             'noise_pred': output.noise_pred,
         }
 
+    @staticmethod
+    def _scalar_reward_from_sample_rewards(sample: BaseSample, reward_name: str) -> float:
+        extra = sample.extra_kwargs.get("rewards")
+        if not isinstance(extra, dict):
+            raise TypeError(
+                f"expected sample.extra_kwargs['rewards'] to be dict before loss mask, "
+                f"got {type(extra).__name__} for reward {reward_name!r}"
+            )
+        if reward_name not in extra:
+            raise KeyError(
+                f"sample.extra_kwargs['rewards'] missing key {reward_name!r}; "
+                f"keys present: {sorted(extra.keys())}"
+            )
+        v = extra[reward_name]
+        if isinstance(v, torch.Tensor):
+            return float(v.detach().float().cpu().item())
+        return float(v)
+
+    def _build_query_group_loss_keep_mask(self, samples: List[BaseSample]) -> torch.Tensor:
+        """
+        Per-sample keep mask (1 = train, 0 = skip loss) from query-group reward statistics.
+
+        A query group (``unique_id``) is masked when, on aggregated rewards (weighted sum across
+        reward models, gathered across ranks), ``mean > high_threshold`` and ``std < low_threshold``.
+        """
+        if not samples:
+            raise ValueError("_build_query_group_loss_keep_mask: empty samples")
+
+        reward_names = sorted(self.reward_models.keys())
+        if not reward_names:
+            return torch.ones(
+                len(samples),
+                dtype=torch.float32,
+                device=self.accelerator.device,
+            )
+
+        reward_tensors: Dict[str, torch.Tensor] = {}
+        for name in reward_names:
+            vals = [self._scalar_reward_from_sample_rewards(s, name) for s in samples]
+            reward_tensors[name] = torch.tensor(
+                vals, dtype=torch.float32, device=self.accelerator.device
+            )
+
+        gathered_rewards = {
+            key: self.accelerator.gather(value).cpu().numpy()
+            for key, value in reward_tensors.items()
+        }
+        aggregated_rewards = np.zeros_like(
+            next(iter(gathered_rewards.values())),
+            dtype=np.float64,
+        )
+        for key, reward_array in gathered_rewards.items():
+            weight = float(self.reward_models[key].config.weight)
+            aggregated_rewards += reward_array * weight
+
+        unique_ids = torch.tensor(
+            [int(s.unique_id) for s in samples],
+            dtype=torch.int64,
+            device=self.accelerator.device,
+        )
+        gathered_ids = self.accelerator.gather(unique_ids).cpu().numpy()
+        hi = float(self.training_args.nft_query_group_loss_mask_high_reward_threshold)
+        lo = float(self.training_args.nft_query_group_loss_mask_low_std_threshold)
+        keep_mask_global, stats = compute_nft_query_group_loss_keep_mask_global(
+            aggregated_rewards,
+            gathered_ids,
+            high_reward_threshold=hi,
+            low_std_threshold=lo,
+        )
+        filtered_samples = int(stats["filtered_samples"])
+        total_samples = int(stats["total_samples"])
+        filtered_group_count = int(stats["filtered_groups"])
+        total_groups = int(stats["total_groups"])
+
+        if stats.get("reset_all"):
+            logger.warning(
+                "Query-group loss mask filtered all samples; disabling mask for this step to keep training stable."
+            )
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Query-group loss mask: filtered %d/%d samples from %d/%d query groups "
+                "(condition: mean>%s and std<%s).",
+                filtered_samples,
+                total_samples,
+                filtered_group_count,
+                total_groups,
+                hi,
+                lo,
+            )
+
+        if self.accelerator.is_main_process:
+            self.log_data(
+                {
+                    "train/query_group_filtered_samples": float(filtered_samples),
+                    "train/query_group_total_samples": float(total_samples),
+                    "train/query_group_filtered_groups": float(filtered_group_count),
+                    "train/query_group_total_groups": float(total_groups),
+                },
+                step=self.step,
+            )
+
+        gathered_len = int(keep_mask_global.shape[0])
+        n_proc = int(self.accelerator.num_processes)
+        if gathered_len % n_proc != 0:
+            raise ValueError(
+                f"Cannot reshape gathered loss mask of length {gathered_len} across "
+                f"{n_proc} processes (remainder non-zero); check sampler / batch sizes."
+            )
+        per_rank = gathered_len // n_proc
+        keep_mask = torch.as_tensor(keep_mask_global, dtype=torch.float32).reshape(
+            n_proc,
+            per_rank,
+        )[int(self.accelerator.process_index)].to(self.accelerator.device)
+        return keep_mask
+
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
         rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
@@ -314,6 +493,14 @@ class DiffusionNFTTrainer(BaseTrainer):
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): NFT matching loss with optional KL."""
+        if self.training_args.nft_query_group_loss_mask:
+            loss_keep_mask = self._build_query_group_loss_keep_mask(samples)
+            for sample, keep in zip(samples, loss_keep_mask):
+                sample.extra_kwargs["loss_keep_mask"] = float(keep.item())
+        else:
+            for sample in samples:
+                sample.extra_kwargs.pop("loss_keep_mask", None)
+
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle samples at the beginning of each inner epoch
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
@@ -430,7 +617,22 @@ class DiffusionNFTTrainer(BaseTrainer):
                             
                             # Combined loss
                             ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta
-                            policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
+                            weighted_policy_loss = ori_policy_loss * adv_clip_range[1]
+                            keep_raw = batch.get("loss_keep_mask")
+                            if keep_raw is None:
+                                keep_mask = torch.ones(
+                                    batch_size, device=adv.device, dtype=adv.dtype
+                                )
+                            else:
+                                keep_mask = torch.as_tensor(
+                                    keep_raw, device=adv.device, dtype=adv.dtype
+                                ).reshape(-1)
+                            if keep_mask.shape[0] != batch_size:
+                                raise ValueError(
+                                    f"loss_keep_mask length {keep_mask.shape[0]} != batch_size {batch_size}"
+                                )
+                            valid_count = torch.clamp(keep_mask.sum(), min=1.0)
+                            policy_loss = (weighted_policy_loss * keep_mask).sum() / valid_count
                             loss = policy_loss
                             
                             # 4. KL penalty
@@ -442,7 +644,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                                     (new_v_pred - ref_output['noise_pred']) ** 2,
                                     dim=tuple(range(1, new_v_pred.ndim))
                                 )
-                                kl_loss = self.training_args.kl_beta * kl_div.mean()
+                                kl_loss = self.training_args.kl_beta * ((kl_div * keep_mask).sum() / valid_count)
                                 loss = loss + kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
                                 loss_info['kl_loss'].append(kl_loss.detach())

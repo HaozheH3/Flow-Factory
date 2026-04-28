@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 import imageio.v3 as iio
 import torch
 from datasets import Dataset as HFDataset
-from datasets import load_dataset, load_from_disk
+from datasets import load_from_disk
 from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
@@ -35,6 +35,47 @@ from ..utils.base import filter_kwargs, pil_image_to_tensor, tensor_to_pil_image
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__, rank_zero_only=True)
+
+
+def _load_jsonl_homogeneous(jsonl_path: str) -> HFDataset:
+    """Load JSONL without HuggingFace auto-inferred struct columns.
+
+    Rows from ToolGen shards store ``evaluation_rubric`` as a JSON object whose
+    keys differ per task. HF ``load_dataset('json')`` merges that into a single
+    Arrow struct schema and fails with ``TypeError: Couldn't cast array`` when
+    keys disagree across rows. We therefore store that field as a JSON string
+    in-memory (existing files may still have nested dicts on disk; both work
+    after normalization here).
+    """
+    records: List[Dict[str, Any]] = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"invalid JSON on line {line_num} of {jsonl_path!r}: {e}"
+                ) from e
+            if not isinstance(row, dict):
+                raise TypeError(
+                    f"expected JSON object on line {line_num} of {jsonl_path!r}, "
+                    f"got {type(row).__name__}: {row!r}"
+                )
+            er = row.get("evaluation_rubric")
+            if isinstance(er, dict):
+                row["evaluation_rubric"] = json.dumps(er, ensure_ascii=False)
+            elif er is not None and not isinstance(er, str):
+                raise TypeError(
+                    f"{jsonl_path!r} line {line_num}: evaluation_rubric must be dict, str, or null, "
+                    f"got {type(er).__name__}: {er!r}"
+                )
+            records.append(row)
+    if not records:
+        return HFDataset.from_list([])
+    return HFDataset.from_list(records)
 
 
 # ========================================================================================
@@ -193,7 +234,7 @@ class GeneralDataset(Dataset):
         txt_path = os.path.join(self.data_root, f"{self.split}.txt")
         
         if os.path.exists(jsonl_path):
-            raw_dataset = load_dataset("json", data_files=jsonl_path, split="train")
+            raw_dataset = _load_jsonl_homogeneous(jsonl_path)
             self.image_dir = os.path.join(self.data_root, "images") if self.image_dir is None else self.image_dir
             self.video_dir = os.path.join(self.data_root, "videos") if self.video_dir is None else self.video_dir
             self.audio_dir = os.path.join(self.data_root, "audios") if self.audio_dir is None else self.audio_dir
@@ -752,7 +793,142 @@ def _move_to_cpu(obj):
 def _resolve_path(base_dir: str, path: str) -> str:
     """Resolve path: use as-is if absolute, otherwise join with base_dir."""
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
-    
+
+
+def _batch_image_column_is_unresolved_paths(column: Any) -> bool:
+    if column is None:
+        return False
+    if not isinstance(column, list) or not column:
+        return False
+    first = column[0]
+    if isinstance(first, str):
+        return True
+    if isinstance(first, list) and first and isinstance(first[0], str):
+        return True
+    return False
+
+
+def _load_path_lists_to_rgb_lists(
+    per_sample_paths: List[Any],
+    *,
+    base_dir: str,
+) -> List[List[Image.Image]]:
+    out: List[List[Image.Image]] = []
+    for per in per_sample_paths:
+        if isinstance(per, str):
+            per_list = [per]
+        elif isinstance(per, list):
+            per_list = per
+        else:
+            raise TypeError(
+                "expected each batch entry to be str or list[str] for filepath conditioning, "
+                f"got {type(per).__name__}: {per!r}"
+            )
+        if not per_list:
+            raise ValueError("empty reference path list in batch entry (need at least one path)")
+        out.append(
+            [
+                Image.open(_resolve_path(base_dir, p)).convert("RGB")
+                for p in per_list
+                if isinstance(p, str) and p.strip()
+            ]
+        )
+        if not out[-1]:
+            raise ValueError(f"no valid path strings after filtering in entry: {per!r}")
+    return out
+
+
+def materialize_jsonl_image_column_for_inference(
+    kwargs: Dict[str, Any],
+    *,
+    dataset_dir: str,
+    image_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """When ``enable_preprocess=False``, HF JSONL rows keep ``image`` as filepath lists.
+
+    :meth:`~flow_factory.models.flux.flux2_klein.Flux2KleinAdapter.inference` expects
+    ``images`` as nested PIL batches. :func:`filter_kwargs` drops unknown ``image``,
+    so conditioning is skipped, ``Flux2KleinSample.condition_images`` is ``None``,
+    and ToolGen judges raise ``condition_images is required``.
+
+    This copies ``kwargs``, moves ``image`` → ``images`` when needed, and loads
+    paths to RGB PIL images using the same resolution rule as preprocessing
+    (``image_dir`` or ``{dataset_dir}/images``).
+    """
+    out = dict(kwargs)
+    root = os.path.expanduser(dataset_dir)
+    base = os.path.expanduser(image_dir) if image_dir is not None else os.path.join(root, "images")
+
+    if _batch_image_column_is_unresolved_paths(out.get("images")):
+        out["images"] = _load_path_lists_to_rgb_lists(out["images"], base_dir=base)
+        out.pop("image", None)
+        return out
+
+    if "images" in out and out["images"] is not None:
+        out.pop("image", None)
+        return out
+
+    if _batch_image_column_is_unresolved_paths(out.get("image")):
+        out["images"] = _load_path_lists_to_rgb_lists(out["image"], base_dir=base)
+        del out["image"]
+        return out
+
+    return out
+
+
+def attach_per_sample_metadata_for_inference(
+    kwargs: Dict[str, Any],
+    *,
+    inference_callable: Callable[..., Any],
+) -> Dict[str, Any]:
+    """When ``metadata`` is absent, fold batched JSONL columns into ``metadata``.
+
+    With ``enable_preprocess=False``, collated batches expose JSONL fields (for
+    example ``user_prompt``, ``verification_checklist``) as top-level keys next
+    to ``prompt`` / ``images``. Adapters
+    :meth:`~flow_factory.models.flux.flux2_klein.Flux2KleinAdapter.inference` and
+    :meth:`~flow_factory.models.qwen_image.qwen_image_edit_plus.QwenImageEditPlusAdapter.inference`
+    declare ``metadata`` for those extras; :func:`flow_factory.utils.base.filter_kwargs`
+    then drops every other column before inference, so nothing reaches
+    ``Flux2KleinSample.extra_kwargs`` unless it is packed here (mirroring
+    :meth:`GeneralDataset._preprocess_batch`, which builds the same structure
+    after preprocessing).
+    """
+    if kwargs.get("metadata") is not None:
+        return kwargs
+
+    prompt = kwargs.get("prompt")
+    if not isinstance(prompt, list) or len(prompt) == 0:
+        return kwargs
+
+    sig = inspect.signature(inference_callable)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+
+    direct_param_names = {
+        name
+        for name, p in sig.parameters.items()
+        if name != "self"
+        and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+
+    batch_size = len(prompt)
+    extra_keys: List[str] = []
+    for key, val in kwargs.items():
+        if key in direct_param_names:
+            continue
+        if isinstance(val, list) and len(val) == batch_size:
+            extra_keys.append(key)
+
+    if not extra_keys:
+        return kwargs
+
+    metadata = [{key: kwargs[key][idx] for key in extra_keys} for idx in range(batch_size)]
+    trimmed = {k: v for k, v in kwargs.items() if k not in extra_keys}
+    trimmed["metadata"] = metadata
+    return trimmed
+
+
 def load_video_frames(video_path: str, fps: Optional[int] = None) -> List[Image.Image]:
     """
     Load video frames using imageio (diffusers standard).

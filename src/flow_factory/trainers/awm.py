@@ -199,6 +199,7 @@ class AWMTrainer(BaseTrainer):
                     **self.eval_args,
                 }
                 inference_kwargs.update(**batch)
+                inference_kwargs = self._materialize_jsonl_images_for_adapter_inference(inference_kwargs)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
                 samples = self.adapter.inference(**inference_kwargs)
                 all_samples.extend(samples)
@@ -269,6 +270,7 @@ class AWMTrainer(BaseTrainer):
                     'trajectory_indices': [-1],
                     **batch,
                 }
+                sample_kwargs = self._materialize_jsonl_images_for_adapter_inference(sample_kwargs)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)        
                 samples.extend(sample_batch)

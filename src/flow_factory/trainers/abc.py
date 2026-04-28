@@ -31,6 +31,10 @@ from accelerate.utils import set_seed, ProjectConfiguration
 from ..hparams import *
 from ..models.abc import BaseAdapter
 from ..data_utils.loader import get_dataloader
+from ..data_utils.dataset import (
+    attach_per_sample_metadata_for_inference,
+    materialize_jsonl_image_column_for_inference,
+)
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
@@ -78,6 +82,18 @@ class BaseTrainer(ABC):
         if self.accelerator.is_local_main_process:
             self.adapter.log_trainable_parameters()
 
+    def _materialize_jsonl_images_for_adapter_inference(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        da = self.config.data_args
+        out = materialize_jsonl_image_column_for_inference(
+            kwargs,
+            dataset_dir=da.dataset_dir,
+            image_dir=da.image_dir,
+        )
+        return attach_per_sample_metadata_for_inference(
+            out,
+            inference_callable=self.adapter.inference,
+        )
+
     @property
     def show_progress_bar(self) -> bool:
         """Whether to show tqdm progress bars."""
@@ -90,6 +106,13 @@ class BaseTrainer(ABC):
             return True
         return self.epoch < m
 
+    def _format_console_scalar(self, k: str, v: float) -> str:
+        """Format one scalar metric for the console summary line."""
+        as_int = isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+        if as_int:
+            return f"{k}={int(v)}"
+        return f"{k}={v:.4f}"
+
     def log_data(self, data: Dict[str, Any], step: int):
         """Log data using the initialized logger."""
         if self.logger is not None:
@@ -100,11 +123,7 @@ class BaseTrainer(ABC):
             metrics = {k: v for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items()) if v is not None}
             if metrics:
                 parts = [f"[Step {step:04d} | Epoch {self.epoch:03d}]"]
-                parts.extend(
-                    f"{k}={int(v)}" if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
-                    else f"{k}={v:.4f}"
-                    for k, v in metrics.items()
-                )
+                parts.extend(self._format_console_scalar(k, v) for k, v in metrics.items())
                 logger.info(" ".join(parts))
     
     def _init_logging_backend(self):

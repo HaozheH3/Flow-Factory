@@ -33,8 +33,15 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 
+from accelerate.utils.operations import gather_object
+
 from ..samples import BaseSample
 from ..rewards import RewardProcessor
+from ..rewards.toolgen_searchbetter_judge_common import (
+    TOOLGEN_JUDGE_LABELED_SCORES_KEY,
+    TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE,
+    toolgen_labeled_dict_rows_to_train_metrics,
+)
 from ..utils.dist import global_zero_std_ratio, global_tensor_stats_batch
 from ..utils.logger_utils import setup_logger
 
@@ -565,6 +572,7 @@ class AdvantageProcessor:
         _log_data["train/adv_abs_mean"] = all_stats["adv_abs"]["mean"]
 
         _log_data["train_samples"] = samples[:30]
+        self._append_toolgen_judge_subscore_metrics(samples, _log_data)
         return _log_data
 
     def _build_gdpo_log_data(
@@ -632,4 +640,26 @@ class AdvantageProcessor:
             "train/adv_abs_mean": all_stats["adv_abs"]["mean"],
             "train_samples": samples[:30],
         })
+        self._append_toolgen_judge_subscore_metrics(samples, _log_data)
         return _log_data
+
+    def _append_toolgen_judge_subscore_metrics(
+        self,
+        samples: List[BaseSample],
+        _log_data: Dict[str, Any],
+    ) -> None:
+        """Add ToolGen train metrics: ``rubric_adaptive_overall_*``, ``checklist_overall_*``, ``generic_*``, ``generic_visual_reference_*`` (global via ``gather_object``)."""
+        local_rows: List[Dict[str, float]] = []
+        for s in samples:
+            vec = s.extra_kwargs.get(TOOLGEN_JUDGE_LABELED_SCORES_KEY)
+            if vec is None:
+                vec = s.extra_kwargs.get(TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE)
+            if vec:
+                local_rows.append({str(k): float(v) for k, v in vec})
+            else:
+                local_rows.append({})
+        gathered_rows: List[Dict[str, float]] = gather_object(local_rows)
+        metrics = toolgen_labeled_dict_rows_to_train_metrics(gathered_rows)
+        _log_data.update(metrics)
+        for s in samples:
+            s.extra_kwargs.pop(TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE, None)

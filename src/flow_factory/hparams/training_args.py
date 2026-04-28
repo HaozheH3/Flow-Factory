@@ -448,6 +448,28 @@ class NFTTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to use EMA parameters for sampling off-policy data."},
     )
+    nft_query_group_loss_mask: bool = field(
+        default=False,
+        metadata={
+            "help": "If true, zero out per-sample NFT loss within a query group when that group's "
+            "aggregated reward mean and std satisfy the mask thresholds (see next fields). "
+            "Uses sample.unique_id as the group key and all-rank gathered rewards."
+        },
+    )
+    nft_query_group_loss_mask_high_reward_threshold: float = field(
+        default=0.9,
+        metadata={
+            "help": "With ``nft_query_group_loss_mask``, mask a group when mean(aggregated rewards) "
+            "is **strictly greater** than this value (rewards in [0, 1])."
+        },
+    )
+    nft_query_group_loss_mask_low_std_threshold: float = field(
+        default=0.05,
+        metadata={
+            "help": "With ``nft_query_group_loss_mask``, mask a group when std(aggregated rewards) "
+            "is **strictly less** than this value."
+        },
+    )
 
     # Clipping / KL
     adv_clip_range: tuple[float, float] = field(
@@ -499,6 +521,17 @@ class NFTTrainingArguments(TrainingArguments):
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
         if self.kl_type not in ['v-based']:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
+        if self.nft_query_group_loss_mask:
+            hi = self.nft_query_group_loss_mask_high_reward_threshold
+            if not (0.0 <= hi <= 1.0):
+                raise ValueError(
+                    f"nft_query_group_loss_mask_high_reward_threshold must be in [0, 1], got {hi!r}"
+                )
+            lo = self.nft_query_group_loss_mask_low_std_threshold
+            if lo < 0.0:
+                raise ValueError(
+                    f"nft_query_group_loss_mask_low_std_threshold must be non-negative, got {lo!r}"
+                )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         assert self.num_train_timesteps is not None

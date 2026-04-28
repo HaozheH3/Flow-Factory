@@ -33,6 +33,12 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'vllm_evaluate': 'flow_factory.rewards.vllm_evaluate.VLMEvaluateRewardModel',
     'rational_rewards_t2i': 'flow_factory.rewards.rational_rewards_t2i.RationalRewardsT2IRewardModel',
     'rational_rewards_edit': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsEditRewardModel',
+    'toolgen_searchbetter_judge': (
+        'flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeRewardModel'
+    ),
+    'toolgen_searchbetter_judge_frontier': (
+        'flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeFrontierRewardModel'
+    ),
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 
