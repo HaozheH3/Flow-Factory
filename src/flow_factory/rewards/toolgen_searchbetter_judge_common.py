@@ -729,6 +729,82 @@ def _strip_assistant_code_fences(text: str) -> str:
     return cleaned.strip()
 
 
+def _repair_whitespace_in_xml_close_tags(text: str) -> str:
+    r"""
+    Normalize ``</ rubric_links>``-style closings to ``</rubric_links>``.
+
+    Invalid XML only; well-formed judge output is unchanged.
+    """
+    return re.sub(r"</\s+([A-Za-z][\w:-]*)\s*>", r"</\1>", text)
+
+
+def _extract_balanced_root_fragment(text: str, local_tag: str) -> Optional[Tuple[int, int]]:
+    """
+    Return ``(start, end)`` slice indices of the first balanced ``<local_tag>...</local_tag>`` subtree.
+
+    Matching is case-insensitive for both open and close. Returns ``None`` if the root is unclosed
+    (truncated output).
+    """
+    tag_re_open = re.compile(rf"<{re.escape(local_tag)}\b[^>]*>", re.IGNORECASE)
+    m = tag_re_open.search(text)
+    if not m:
+        return None
+    start = m.start()
+    i = m.end()
+    depth = 1
+    tag_re_open2 = re.compile(rf"<{re.escape(local_tag)}\b[^>]*>", re.IGNORECASE)
+    tag_re_close = re.compile(rf"</{re.escape(local_tag)}\s*>", re.IGNORECASE)
+    while i < len(text) and depth > 0:
+        next_open = tag_re_open2.search(text, i)
+        next_close = tag_re_close.search(text, i)
+        if next_close is None:
+            return None
+        next_open_start = next_open.start() if next_open is not None else len(text) + 1
+        close_start = next_close.start()
+        if next_open is not None and next_open_start < close_start:
+            depth += 1
+            i = next_open.end()
+        else:
+            depth -= 1
+            if depth == 0:
+                return (start, next_close.end())
+            i = next_close.end()
+    return None
+
+
+def _extract_first_judge_root_xml_fragment(cleaned: str) -> Optional[str]:
+    """
+    Extract the first judge root XML document from ``cleaned`` text.
+
+    Prefer the earliest-starting root among ``evaluation``, ``judge_output``, ``tgj``, and
+    ``toolgen_judge_output``. Unlike a single backreference regex, open/close tags may differ in
+    case (e.g. ``<Evaluation>...</evaluation>``).
+    """
+    spans: List[Tuple[int, int]] = []
+    for local in ("evaluation", "judge_output", "tgj", "toolgen_judge_output"):
+        sp = _extract_balanced_root_fragment(cleaned, local)
+        if sp is not None:
+            spans.append(sp)
+    if not spans:
+        return None
+    spans.sort(key=lambda item: item[0])
+    start, end = spans[0]
+    return cleaned[start:end]
+
+
+def _preprocess_judge_xml_text_for_parse(text: str) -> str:
+    """
+    Strip code fences and apply :func:`_repair_common_judge_xml_typos` before root extraction.
+
+    Keeps behavior predictable for well-formed ``<evaluation>`` output; does not apply ad-hoc
+    repairs for malformed model-specific corner cases.
+    """
+    cleaned = _strip_assistant_code_fences(text)
+    cleaned = _repair_whitespace_in_xml_close_tags(cleaned)
+    cleaned = _repair_common_judge_xml_typos(cleaned)
+    return cleaned
+
+
 def _repair_malformed_score_closing_tags(text: str) -> str:
     """
     Fix frontier XML where ``</score>`` is truncated to ``</5`` before a real ``</score>``, or to ``</5>``.
@@ -1250,16 +1326,16 @@ def parse_judge_xml_to_dict(text: str) -> Optional[Dict[str, Any]]:
     ``toolgen_judge_output``) into the same dict shape as legacy JSON (``reference_criterion_alignment``,
     ``checklist_scores``, ``rubric_scores``, ``visual_reference_evaluation``, ``text_reference_evaluation``) for
     :func:`parsed_judge_labeled_scores_03`.
+
+    The root element is extracted with case-insensitive matching on the closing tag so a
+    well-formed document such as ``<Evaluation>...</evaluation>`` still parses (the previous
+    single-regex path required identical casing on the close tag).
     """
-    cleaned = _repair_common_judge_xml_typos(_strip_assistant_code_fences(text))
-    m = re.search(
-        r"<(evaluation|judge_output|tgj|toolgen_judge_output)\b[^>]*>.*?</\1>",
-        cleaned,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
+    cleaned = _preprocess_judge_xml_text_for_parse(text)
+    fragment = _extract_first_judge_root_xml_fragment(cleaned)
+    if not fragment:
         return None
-    fragment = _repair_bare_xml_ampersands_in_fragment(m.group(0))
+    fragment = _repair_bare_xml_ampersands_in_fragment(fragment)
     try:
         root = ET.fromstring(fragment)
     except ET.ParseError:

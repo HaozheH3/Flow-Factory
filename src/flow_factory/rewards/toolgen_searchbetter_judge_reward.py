@@ -72,6 +72,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
 FRONTIER_JUDGE_LOG = logging.getLogger(__name__ + ".frontier_judge")
+logger = logging.getLogger(__name__)
+
+# One full judge completion plus one extra completion if the response does not parse.
+TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES = 2
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -160,6 +164,8 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
     ``extra_kwargs`` (subset): ``api_base_url``, ``api_key``, ``vlm_model``, ``max_concurrent``,
     ``max_retries``, ``timeout``, ``temperature``, ``max_tokens``, ``max_pixels`` (per image_url,
     default ``589824``), ``variant`` (string tag in the evaluation context, default ``training``).
+    After transport retries, **one** extra full judge completion is attempted when the reply is
+    empty, unparsable as XML/JSON, or fails labeled-score extraction; only then errors propagate.
     ``toolgen_judge_unparsed_dump_dir`` (optional path): when the judge reply cannot be parsed as
     XML/JSON, write the full raw assistant string to a ``*.judge_unparsed.txt`` file under this
     directory (see also env ``FLOW_FACTORY_JUDGE_UNPARSED_DUMP_DIR`` / ``TOOLGEN_JUDGE_UNPARSED_DUMP_DIR``).
@@ -393,32 +399,54 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
             {"role": "user", "content": interleaved},
         ]
 
-        last_err: Optional[BaseException] = None
-        for attempt in range(self.max_retries):
-            try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
-                        model=self.vlm_model,
-                        messages=messages,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                        timeout=self.timeout,
-                    )
-            except (APIConnectionError, APITimeoutError, RateLimitError, asyncio.TimeoutError) as e:
-                last_err = e
-                if attempt + 1 >= self.max_retries:
+        last_transport_err: Optional[BaseException] = None
+        for parse_try in range(TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES):
+            completion = None
+            last_transport_err = None
+            for attempt in range(self.max_retries):
+                try:
+                    async with self.semaphore:
+                        completion = await self.client.chat.completions.create(
+                            model=self.vlm_model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                            timeout=self.timeout,
+                        )
                     break
-                await asyncio.sleep(2**attempt)
-                continue
+                except (APIConnectionError, APITimeoutError, RateLimitError, asyncio.TimeoutError) as e:
+                    last_transport_err = e
+                    if attempt + 1 >= self.max_retries:
+                        break
+                    await asyncio.sleep(2**attempt)
+            if completion is None:
+                raise RuntimeError(
+                    f"ToolGenSearchBetterJudge HTTP request failed after {self.max_retries} attempt(s)"
+                ) from last_transport_err
 
             content = completion.choices[0].message.content
             if content is None or not str(content).strip():
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    logger.warning(
+                        "ToolGenSearchBetterJudge: empty judge content (parse_try %s/%s); retrying completion",
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
                 raise ValueError(
                     "Judge returned empty assistant content; cannot parse ToolGen-style judge output"
                 )
-            parsed = try_parse_judge_output(str(content))
+
+            raw = str(content)
+            parsed = try_parse_judge_output(raw)
             if parsed is None:
-                raw = str(content)
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    logger.warning(
+                        "ToolGenSearchBetterJudge: failed to parse judge output (parse_try %s/%s); retrying completion",
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
                 if self._unparsed_dump_dir is not None:
                     stem = _make_judge_response_dump_stem(
                         run_id=self._judge_artifact_run_id,
@@ -441,17 +469,28 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
                     "Failed to parse strict XML/JSON from judge response; "
                     f"first 500 chars: {raw[:500]!r}"
                 )
-            labeled = parsed_judge_labeled_scores_03(parsed)
-            reward = float(
-                parsed_judge_json_to_weighted_reward(
-                    parsed, rubric, **self._judge_reward_weights
+
+            try:
+                labeled = parsed_judge_labeled_scores_03(parsed)
+                reward = float(
+                    parsed_judge_json_to_weighted_reward(
+                        parsed, rubric, **self._judge_reward_weights
+                    )
                 )
-            )
+            except (ValueError, TypeError, KeyError) as exc:
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    logger.warning(
+                        "ToolGenSearchBetterJudge: judge labeled scores invalid (%s; parse_try %s/%s); retrying completion",
+                        exc,
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
+                raise
+
             return reward, labeled
 
-        raise RuntimeError(
-            f"ToolGenSearchBetterJudge HTTP request failed after {self.max_retries} attempt(s)"
-        ) from last_err
+        raise RuntimeError("ToolGenSearchBetterJudge: exhausted parse completion retries without success")
 
 
 class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
@@ -469,7 +508,8 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
     - ``frontier_api_timeout`` or ``timeout`` (int, seconds): HTTP timeout for each Frontier request
       (sets ``LLMClient.default_timeout``; default ToolGen value is ``180``).
     - ``max_concurrent``: thread pool size for parallel judge calls (default ``2``).
-    - ``max_retries``, ``temperature``, ``max_tokens``, ``max_pixels``, ``variant``: same semantics as OpenAI path;
+    - ``max_retries``, ``temperature``, ``max_tokens``, ``max_pixels``, ``variant``: same semantics as OpenAI path
+      (including **one** extra full completion on empty / unparseable / invalid labeled output);
       ``max_pixels`` default ``589824`` (``768 * 768``, matching ``evaluate_searchbetter_hard_direct``).
     - Same aggregate reward args as the HTTP class: ``toolgen_judge_checklist_item_weight``,
       ``toolgen_judge_major_aspect_weights`` (see
@@ -491,9 +531,12 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
       parts with ``data:`` image URLs redacted (text blocks kept).
     - ``frontier_judge_max_dump_response_chars`` (int, default ``500000``): cap stored assistant text.
     - ``frontier_judge_console_progress`` (bool, default ``True``): ``INFO`` log per sample when a request completes (``DONE``); per-sample ``START`` lines are not emitted to keep logs small.
-    - ``frontier_judge_error_policy``: ``raise`` (default) or ``penalize``. On API/parse failure after retries:
-      ``raise`` aborts training with an error;       ``penalize`` assigns ``frontier_judge_penalty_value`` (default ``0.0``)
-      for that sample and logs a warning. Successful parses use ``parsed_judge_json_to_weighted_reward``
+    - ``frontier_judge_error_policy``: ``raise`` (default) or ``penalize``. After transport retries and
+      one extra completion on empty / unparseable / invalid labeled output, ``raise`` aborts training;
+      ``penalize`` assigns ``frontier_judge_penalty_value`` (default ``0.0``). When other samples in the
+      same ``unique_id`` group have a successful parse, :class:`~flow_factory.rewards.reward_processor.RewardProcessor`
+      overwrites the penalty with the mean reward of those successful members before advantage / DPO pairing.
+      Successful parses use ``parsed_judge_json_to_weighted_reward``
       (configurable; defaults match the legacy unweighted mean when all weights are ``1``) on ``[0, 1]``.
     - ``toolgen_group_drop_constant_score_dims`` (bool, default ``False``): after scoring, regroup by
       ``sample.unique_id`` and replace each sample's reward with the mean of only those score dimensions
@@ -768,144 +811,168 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
         if self._dump_dir is not None and self._dump_redacted_request:
             dump_request = _redact_interleaved_for_dump(interleaved)
 
-        try:
-            result = self.frontier.client.multimodal_chat_multiimages_with_retry(
-                sys_prompt=JUDGE_SYSTEM_PROMPT,
-                text_prompt=text_prompt,
-                user_content=interleaved,
-                temperature=float(self.frontier.temperature),
-                max_tokens=self.max_tokens,
-                max_retries=self.max_retries,
-                timeout=self._api_timeout,
-            )
-        except Exception as exc:
-            r = self._fail_sample(
-                base=base,
-                status="request_exception",
-                message=f"{type(exc).__name__}: {exc}",
-                dump_stem=dump_stem,
-                edited=edited,
-                extra={"interleaved_redacted": dump_request, "api_summary": None},
-            )
-            return r, None
-
-        api_summary = _summarize_api_result(result)
-        if isinstance(result, dict) and result.get("_error") is not None:
-            err_txt = str(result.get("_error"))
-            r = self._fail_sample(
-                base=base,
-                status="api_error",
-                message=err_txt,
-                dump_stem=dump_stem,
-                edited=edited,
-                extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
-            )
-            return r, None
-
-        ok, response_text, err = self.frontier.client.extract_message_from_response(result)
-        if not ok or response_text is None:
-            msg = err or "empty or unparseable assistant message"
-            r = self._fail_sample(
-                base=base,
-                status="extract_failed",
-                message=f"{msg}; api_summary={api_summary!r}",
-                dump_stem=dump_stem,
-                edited=edited,
-                extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
-            )
-            return r, None
-
-        rt_full = str(response_text)
-        rt_stored = _truncate_text(rt_full, self._max_dump_response_chars)
-        parsed = try_parse_judge_output(rt_full)
-        if parsed is None:
-            if self._unparsed_dump_dir is not None:
-                stem_unparsed = (
-                    dump_stem
-                    if dump_stem is not None
-                    else _make_judge_response_dump_stem(
-                        run_id=self._dump_run_id,
-                        intra_batch_index=intra_batch_index,
-                        trajectory_id=trajectory_id,
-                        request_index=request_index,
-                    )
+        for parse_try in range(TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES):
+            try:
+                result = self.frontier.client.multimodal_chat_multiimages_with_retry(
+                    sys_prompt=JUDGE_SYSTEM_PROMPT,
+                    text_prompt=text_prompt,
+                    user_content=interleaved,
+                    temperature=float(self.frontier.temperature),
+                    max_tokens=self.max_tokens,
+                    max_retries=self.max_retries,
+                    timeout=self._api_timeout,
                 )
-                write_toolgen_judge_unparsed_response_dump(
-                    self._unparsed_dump_dir,
-                    stem=stem_unparsed,
-                    raw_response=rt_full,
-                    meta={
-                        "reward_model": "toolgen_searchbetter_judge_frontier",
-                        "call_id": call_id,
-                        "model_name": self.frontier_model_name,
-                        "status": "parse_error",
+            except Exception as exc:
+                r = self._fail_sample(
+                    base=base,
+                    status="request_exception",
+                    message=f"{type(exc).__name__}: {exc}",
+                    dump_stem=dump_stem,
+                    edited=edited,
+                    extra={"interleaved_redacted": dump_request, "api_summary": None},
+                )
+                return r, None
+
+            api_summary = _summarize_api_result(result)
+            if isinstance(result, dict) and result.get("_error") is not None:
+                err_txt = str(result.get("_error"))
+                r = self._fail_sample(
+                    base=base,
+                    status="api_error",
+                    message=err_txt,
+                    dump_stem=dump_stem,
+                    edited=edited,
+                    extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
+                )
+                return r, None
+
+            ok, response_text, err = self.frontier.client.extract_message_from_response(result)
+            if not ok or response_text is None:
+                msg = err or "empty or unparseable assistant message"
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    FRONTIER_JUDGE_LOG.warning(
+                        "[%s] extract_failed (%s); parse_try %s/%s — retrying judge completion",
+                        call_id,
+                        msg,
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
+                r = self._fail_sample(
+                    base=base,
+                    status="extract_failed",
+                    message=f"{msg}; api_summary={api_summary!r}",
+                    dump_stem=dump_stem,
+                    edited=edited,
+                    extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
+                )
+                return r, None
+
+            rt_full = str(response_text)
+            rt_stored = _truncate_text(rt_full, self._max_dump_response_chars)
+            parsed = try_parse_judge_output(rt_full)
+            if parsed is None:
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    FRONTIER_JUDGE_LOG.warning(
+                        "[%s] judge XML/JSON parse failed; parse_try %s/%s — retrying judge completion",
+                        call_id,
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
+                if self._unparsed_dump_dir is not None:
+                    stem_unparsed = (
+                        dump_stem
+                        if dump_stem is not None
+                        else _make_judge_response_dump_stem(
+                            run_id=self._dump_run_id,
+                            intra_batch_index=intra_batch_index,
+                            trajectory_id=trajectory_id,
+                            request_index=request_index,
+                        )
+                    )
+                    write_toolgen_judge_unparsed_response_dump(
+                        self._unparsed_dump_dir,
+                        stem=stem_unparsed,
+                        raw_response=rt_full,
+                        meta={
+                            "reward_model": "toolgen_searchbetter_judge_frontier",
+                            "call_id": call_id,
+                            "model_name": self.frontier_model_name,
+                            "status": "parse_error",
+                            "api_summary": api_summary,
+                        },
+                    )
+                r = self._fail_sample(
+                    base=base,
+                    status="parse_error",
+                    message=(
+                        "Failed to parse strict XML/JSON from Frontier response; "
+                        f"first 500 chars: {rt_full[:500]!r}"
+                    ),
+                    dump_stem=dump_stem,
+                    edited=edited,
+                    extra={
                         "api_summary": api_summary,
+                        "response_text": rt_stored,
+                        "response_truncated": len(rt_stored) < len(rt_full),
+                        "interleaved_redacted": dump_request,
                     },
                 )
-            r = self._fail_sample(
-                base=base,
-                status="parse_error",
-                message=(
-                    "Failed to parse strict XML/JSON from Frontier response; "
-                    f"first 500 chars: {rt_full[:500]!r}"
-                ),
-                dump_stem=dump_stem,
-                edited=edited,
-                extra={
-                    "api_summary": api_summary,
-                    "response_text": rt_stored,
-                    "response_truncated": len(rt_stored) < len(rt_full),
-                    "interleaved_redacted": dump_request,
-                },
-            )
-            return r, None
+                return r, None
 
-        try:
-            labeled = parsed_judge_labeled_scores_03(parsed)
-            reward = float(
-                parsed_judge_json_to_weighted_reward(parsed, rubric, **self._judge_reward_weights)
-            )
-        except (ValueError, TypeError, KeyError) as exc:
-            r = self._fail_sample(
-                base=base,
-                status="invalid_parsed_output",
-                message=f"{type(exc).__name__}: {exc}",
-                dump_stem=dump_stem,
-                edited=edited,
-                extra={
-                    "api_summary": api_summary,
-                    "response_text": rt_stored,
-                    "response_truncated": len(rt_stored) < len(rt_full),
-                    "interleaved_redacted": dump_request,
-                    "parsed": parsed,
-                },
-            )
-            return r, None
-        out = {
-            **base,
-            "status": "ok",
-            "error": None,
-            "api_summary": api_summary,
-            "response_text": rt_stored,
-            "response_truncated": len(rt_stored) < len(rt_full),
-            "parsed": parsed,
-            "labeled_scores_03": labeled,
-            "reward": reward,
-        }
-        if dump_request is not None:
-            out["interleaved_redacted"] = dump_request
-        if dump_stem is not None:
-            self._persist_eval_artifact_pair(dump_stem, out, edited)
+            try:
+                labeled = parsed_judge_labeled_scores_03(parsed)
+                reward = float(
+                    parsed_judge_json_to_weighted_reward(parsed, rubric, **self._judge_reward_weights)
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                if parse_try + 1 < TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES:
+                    FRONTIER_JUDGE_LOG.warning(
+                        "[%s] invalid parsed judge scores (%s: %s); parse_try %s/%s — retrying judge completion",
+                        call_id,
+                        type(exc).__name__,
+                        exc,
+                        parse_try + 1,
+                        TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
+                    )
+                    continue
+                r = self._fail_sample(
+                    base=base,
+                    status="invalid_parsed_output",
+                    message=f"{type(exc).__name__}: {exc}",
+                    dump_stem=dump_stem,
+                    edited=edited,
+                    extra={
+                        "api_summary": api_summary,
+                        "response_text": rt_stored,
+                        "response_truncated": len(rt_stored) < len(rt_full),
+                        "interleaved_redacted": dump_request,
+                        "parsed": parsed,
+                    },
+                )
+                return r, None
+            out = {
+                **base,
+                "status": "ok",
+                "error": None,
+                "api_summary": api_summary,
+                "response_text": rt_stored,
+                "response_truncated": len(rt_stored) < len(rt_full),
+                "parsed": parsed,
+                "labeled_scores_03": labeled,
+                "reward": reward,
+            }
+            if dump_request is not None:
+                out["interleaved_redacted"] = dump_request
+            if dump_stem is not None:
+                self._persist_eval_artifact_pair(dump_stem, out, edited)
 
-        # if self._console_progress:
-        #     FRONTIER_JUDGE_LOG.info(
-        #         "[%s] DONE sample %s/%s reward=%.6f",
-        #         call_id,
-        #         intra_batch_index + 1,
-        #         batch_len,
-        #         reward,
-        #     )
-        return reward, labeled
+            return reward, labeled
+
+        raise RuntimeError(
+            "ToolGenSearchBetterJudgeFrontierRewardModel: exhausted parse completion retries without success"
+        )
 
     @torch.no_grad()
     def __call__(

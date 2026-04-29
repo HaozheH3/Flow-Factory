@@ -121,6 +121,63 @@ class RewardProcessor:
 
         return batch_size
 
+    def _apply_toolgen_impute_failed_judge_from_group_mean(
+        self,
+        reward_name: str,
+        rewards: torch.Tensor,
+        samples: List[BaseSample],
+    ) -> torch.Tensor:
+        """
+        For samples that share a ``unique_id`` group: if at least one member received a successful
+        ToolGen judge parse (``_toolgen_judge_labeled_scores`` on the sample) and at least one did
+        not, replace failed members' scalar rewards with the mean reward of the successful members.
+
+        Runs before :meth:`_apply_toolgen_group_drop_constant_dims` so penalty defaults (e.g. ``0.0``)
+        are not mistaken for genuinely low image quality when forming DPO/advantage groups.
+        Non-ToolGen rewards never set the labeled-scores key, so this is a no-op for those models.
+        """
+        out = rewards.clone()
+        uid_to_indices: Dict[int, List[int]] = defaultdict(list)
+        for i, s in enumerate(samples):
+            uid_to_indices[s.unique_id].append(i)
+
+        imputed_groups = 0
+        for _uid, idxs in uid_to_indices.items():
+            if len(idxs) < 2:
+                continue
+            successful = [
+                i
+                for i in idxs
+                if samples[i].extra_kwargs.get(TOOLGEN_JUDGE_LABELED_SCORES_KEY) is not None
+            ]
+            failed = [i for i in idxs if i not in successful]
+            if not successful or not failed:
+                continue
+            mean_s = float(out[successful].mean().item())
+            for i in failed:
+                out[i] = mean_s
+            imputed_groups += 1
+
+        if imputed_groups and self.verbose and self.accelerator.is_local_main_process:
+            logger.info(
+                "Reward %r: imputed ToolGen judge-failure rewards from group mean in %s group(s)",
+                reward_name,
+                imputed_groups,
+            )
+        return out
+
+    def _postprocess_toolgen_judge_pointwise_tensor(
+        self,
+        reward_name: str,
+        stacked: torch.Tensor,
+        samples: List[BaseSample],
+    ) -> torch.Tensor:
+        """Group-mean imputation for judge failures, then optional drop-constant-dim adjustment."""
+        adjusted = self._apply_toolgen_impute_failed_judge_from_group_mean(
+            reward_name, stacked, samples
+        )
+        return self._apply_toolgen_group_drop_constant_dims(reward_name, adjusted, samples)
+
     def _apply_toolgen_group_drop_constant_dims(
         self,
         reward_name: str,
@@ -134,6 +191,8 @@ class RewardProcessor:
         Samples without labeled scores (judge/API/parse failure) are **excluded** from the std
         computation; they receive the **mean** of the adjusted rewards of successful members in
         that group so they sit at the group average (near-zero relative advantage vs group mean).
+        :meth:`_apply_toolgen_impute_failed_judge_from_group_mean` runs first and already aligns raw
+        penalties with the successful mean when this flag is off.
         """
         cfg = self.reward_configs.get(reward_name)
         if cfg is None or not bool(
@@ -419,7 +478,7 @@ class RewardProcessor:
                 rewards.append(reward_tensor)
             
             stacked = torch.cat(rewards, dim=0)
-            results[name] = self._apply_toolgen_group_drop_constant_dims(name, stacked, samples)
+            results[name] = self._postprocess_toolgen_judge_pointwise_tensor(name, stacked, samples)
         
         return results
 
@@ -964,7 +1023,7 @@ class RewardBuffer:
                 f"Missing rewards for async model '{name}'"
             )
             stacked = torch.stack(reward_list)
-            results[name] = self.rp._apply_toolgen_group_drop_constant_dims(
+            results[name] = self.rp._postprocess_toolgen_judge_pointwise_tensor(
                 name, stacked, self.all_samples
             )
         return results

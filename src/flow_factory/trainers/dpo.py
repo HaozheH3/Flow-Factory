@@ -221,6 +221,22 @@ class DPOTrainer(BaseTrainer):
         adv = sample.extra_kwargs['advantage']
         return adv.item() if hasattr(adv, 'item') else float(adv)
 
+    def _get_aggregated_reward(self, sample: BaseSample) -> float:
+        """Weighted sum of per-head rewards (same weighting as :class:`AdvantageProcessor`).
+
+        ``extra_kwargs['rewards']`` is populated after :meth:`prepare_feedback`; this scalar is
+        *before* group normalization / GDPO stacking (unlike advantage).
+        """
+        rew_map = sample.extra_kwargs.get('rewards')
+        if rew_map is None or len(rew_map) == 0:
+            return float('nan')
+        total = 0.0
+        for name, val in rew_map.items():
+            w = float(self.advantage_processor.reward_weights.get(name, 1.0))
+            vv = val.item() if torch.is_tensor(val) else float(val)
+            total += w * vv
+        return total
+
     def _form_pairs(
         self,
         samples: List[BaseSample],
@@ -304,12 +320,22 @@ class DPOTrainer(BaseTrainer):
             chosen_advs = np.array([self._get_advantage(p[0]) for p in stat_pairs])
             rejected_advs = np.array([self._get_advantage(p[1]) for p in stat_pairs])
             margins = chosen_advs - rejected_advs
+            chosen_reward = np.array([self._get_aggregated_reward(p[0]) for p in stat_pairs])
+            rejected_reward = np.array([self._get_aggregated_reward(p[1]) for p in stat_pairs])
             local_stats = torch.tensor(
-                [float(n), float(chosen_advs.sum()), float(rejected_advs.sum()), float(margins.sum())],
-                device=self.accelerator.device, dtype=torch.float64,
+                [
+                    float(n),
+                    float(chosen_advs.sum()),
+                    float(rejected_advs.sum()),
+                    float(margins.sum()),
+                    float(np.nansum(chosen_reward)),
+                    float(np.nansum(rejected_reward)),
+                ],
+                device=self.accelerator.device,
+                dtype=torch.float64,
             )
         else:
-            local_stats = torch.zeros(4, device=self.accelerator.device, dtype=torch.float64)
+            local_stats = torch.zeros(6, device=self.accelerator.device, dtype=torch.float64)
 
         global_stats = self.accelerator.reduce(local_stats, reduction="sum")
         total_n = global_stats[0].item()
@@ -318,6 +344,12 @@ class DPOTrainer(BaseTrainer):
             _log_data['train/dpo_chosen_adv_mean'] = global_stats[1].item() / total_n
             _log_data['train/dpo_rejected_adv_mean'] = global_stats[2].item() / total_n
             _log_data['train/dpo_adv_margin_mean'] = global_stats[3].item() / total_n
+            # Aggregate reward gaps *before* advantage normalization (sum_k w_k r_k across reward heads).
+            _log_data['train/dpo_pair_reward_chosen_mean'] = global_stats[4].item() / total_n
+            _log_data['train/dpo_pair_reward_rejected_mean'] = global_stats[5].item() / total_n
+            _log_data['train/dpo_pair_reward_gap_mean'] = (
+                global_stats[4].item() - global_stats[5].item()
+            ) / total_n
 
         return pairs, _log_data
 
@@ -616,6 +648,7 @@ class DPOTrainer(BaseTrainer):
                             with torch.no_grad():
                                 implicit_reward_chosen = -0.5 * beta * w_diff
                                 implicit_reward_rejected = -0.5 * beta * l_diff
+                                implicit_reward_gap = (implicit_reward_chosen - implicit_reward_rejected).mean()
                                 implicit_accuracy = (implicit_reward_chosen > implicit_reward_rejected).float().mean()
 
                             loss_info['loss'].append(loss.detach())
@@ -626,6 +659,7 @@ class DPOTrainer(BaseTrainer):
                             loss_info['implicit_accuracy'].append(implicit_accuracy.detach())
                             loss_info['implicit_reward_chosen'].append(implicit_reward_chosen.mean().detach())
                             loss_info['implicit_reward_rejected'].append(implicit_reward_rejected.mean().detach())
+                            loss_info['implicit_reward_gap'].append(implicit_reward_gap.detach())
 
                             # Backward + optimizer step
                             self.accelerator.backward(loss)

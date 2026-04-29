@@ -17,6 +17,7 @@
 #   TRAIN_LOG=/path/to/run.log TRAIN_LOG_TEE=0 ./scripts/start_train_rational_rewards_t2i.sh   # file only, no tee
 #
 # Optional env:
+#   NUM_PROCESSES       If set, passed as `--num_processes` to the launcher (overrides YAML). If unset, YAML + visible GPUs apply.
 #   FLOWFACTORY_PYTHON  Python interpreter (default: same as this script's bash → `python3` / PATH)
 #   CONFIG              Training YAML under repo root (default: qwen_image_rational_rewards_t2i_local_models.yaml)
 #   LOCAL_MODELS_ROOT   Directory with mirrored HF-style trees (default: /primus_xpfs_workspace_T04/ghl/models)
@@ -41,7 +42,7 @@ cd "${REPO_ROOT}"
 # ---------------------------------------------------------------------------
 # If your training env is not default `python3`, set e.g.:
 #   export FLOWFACTORY_PYTHON="/primus_xpfs_workspace_T04/haozhe/flow_env/bin/python"
-FLOWFACTORY_PYTHON="${FLOWFACTORY_PYTHON:-python3}"
+FLOWFACTORY_PYTHON="${FLOWFACTORY_PYTHON:-/primus_xpfs_workspace_T04/haozhe/flow_env/bin/python3}"
 
 LOCAL_MODELS_ROOT="${LOCAL_MODELS_ROOT:-/primus_xpfs_workspace_T04/ghl/models}"
 
@@ -49,6 +50,12 @@ LOCAL_MODELS_ROOT="${LOCAL_MODELS_ROOT:-/primus_xpfs_workspace_T04/ghl/models}"
 CONFIG="${CONFIG:-/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/nft/lora/flux2_klein_judge_frontier_new_dist.yaml}"
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/nft/lora/qwen1edit_new.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/nft/lora/flux2_klein_judge_frontier_new.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo_warmstart_lora.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/lora/flux2_klein_judge_frontier.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/full/flux2_klein_toolgen_judge_dpo.yaml
+CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/full/flux2_klein_toolgen_judge_dpo_9b.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/full/flux2_klein_judge_frontier.yaml
 # Ephemeral / bulky caches: keep under repo .runtime_cache; Hugging Face hub reads use LOCAL_MODELS_ROOT
 FLOW_CACHE_ROOT="${FLOW_CACHE_ROOT:-${REPO_ROOT}/.runtime_cache}"
 mkdir -p "${FLOW_CACHE_ROOT}/"{tmp,torch,xdg,logs}
@@ -63,7 +70,7 @@ export TMPDIR="${TMPDIR:-${FLOW_CACHE_ROOT}/tmp}"
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}" "${TRANSFORMERS_CACHE}" "${XDG_CACHE_HOME}" "${TORCH_HOME}" "${TMPDIR}"
 
 if [[ "${SKIP_TRAIN_LOG:-0}" != "1" ]]; then
-  TRAIN_LOG="${TRAIN_LOG:-${FLOW_CACHE_ROOT}/logs/train_search_$(date +%Y%m%d_%H%M%S).log}"
+  TRAIN_LOG="${TRAIN_LOG:-${FLOW_CACHE_ROOT}/logs/train_ff_$(date +%Y%m%d_%H%M%S).log}"
   mkdir -p "$(dirname "${TRAIN_LOG}")"
   if [[ "${TRAIN_LOG_TEE:-1}" == "1" ]]; then
     echo "[flow-factory] logging stdout+stderr to ${TRAIN_LOG} (and terminal)"
@@ -118,4 +125,20 @@ fi
 # fi
 
 echo "[flow-factory] training with config: ${CONFIG}"
-exec "${FLOWFACTORY_PYTHON}" -m flow_factory.cli "${CONFIG}" "$@"
+
+# ---------------------------------------------------------------------------
+# Multi-GPU: flow_factory.cli must spawn `accelerate launch`. It uses a
+# single-process "Direct launch" when RANK is set in the environment—even
+# RANK=0 from Slurm or a parent shell—causing World Size 1 and one busy GPU.
+# Clear stale single-rank markers so the YAML `num_processes` (or --num_processes
+# below) actually runs multi-process training.
+# ---------------------------------------------------------------------------
+unset RANK WORLD_SIZE LOCAL_RANK OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE 2>/dev/null || true
+
+_EXTRA_CLI=()
+if [[ -n "${NUM_PROCESSES:-}" ]]; then
+  _EXTRA_CLI+=(--num_processes "${NUM_PROCESSES}")
+  echo "[flow-factory] --num_processes ${NUM_PROCESSES} (CLI overrides YAML)"
+fi
+
+exec "${FLOWFACTORY_PYTHON}" -m flow_factory.cli "${CONFIG}" "${_EXTRA_CLI[@]}" "$@"

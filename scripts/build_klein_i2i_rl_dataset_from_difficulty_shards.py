@@ -36,9 +36,11 @@ Plan
 ``_shard_worker_task`` (spawn-safe). Output order follows sorted shard filenames (``Pool.imap``).
 Use ``--workers 1`` to disable multiprocessing (still shows tqdm when tqdm is installed).
 
-**Post steps** (same run): optional **train/test split** of the written ``--output`` file; then
-**reference image pruning** via ``prune_jsonl_broken_reference_images.py`` (decode check,
-``--max-images``, optional pixel percentile) on the resulting JSONL file(s). Web knowledge
+**Post steps** (same run, in order): **normalize** condition images to ``--normalize-size`` (white
+letterbox) under ``<output-parent>/<normalize-subdir>/``, rewrite ``image`` and
+``augmented_generation_details.eval_reference_slots`` paths; **prune** the combined JSONL via
+``prune_jsonl_broken_reference_images.py``; then **train/test split** (``--test-count``, default 64)
+so the test set has exactly that many rows if enough remain after drops. Web knowledge
 ``eval_text_knowledge_slots`` is filled from analysis (see ToolGen
 ``build_eval_text_knowledge_slots_from_analysis``).
 
@@ -54,6 +56,7 @@ Or: ``bash scripts/build_klein_i2i_rl_dataset.sh`` (see that file for ``OUTPUT_J
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -61,6 +64,7 @@ import random
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -273,6 +277,246 @@ def _empty_stats() -> Dict[str, int]:
 def _merge_stats(dst: Dict[str, int], src: Dict[str, int]) -> None:
     for k, v in src.items():
         dst[k] = dst.get(k, 0) + v
+
+
+def _row_image_paths(row: Dict[str, Any]) -> List[str]:
+    """Absolute paths from row['image'] (str or list[str])."""
+    raw = row.get("image")
+    if raw is None:
+        return []
+    if isinstance(raw, str) and raw.strip():
+        return [str(Path(raw.strip()).resolve())]
+    if isinstance(raw, list):
+        out: List[str] = []
+        for x in raw:
+            if isinstance(x, str) and x.strip():
+                out.append(str(Path(x.strip()).resolve()))
+        return out
+    raise TypeError(
+        f"row trajectory_id={row.get('trajectory_id')!r}: 'image' must be str, list[str], or null, "
+        f"got {type(raw).__name__}"
+    )
+
+
+def _patch_eval_reference_slots_paths(
+    row: Dict[str, Any],
+    src_to_dst: Dict[str, str],
+    failures: Dict[str, str],
+) -> bool:
+    """Rewrite local paths in ``eval_reference_slots`` to normalized PNGs. False => drop row."""
+    ag = row.get("augmented_generation_details")
+    if not isinstance(ag, dict):
+        return True
+    slots = ag.get("eval_reference_slots")
+    if not isinstance(slots, list):
+        return True
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        for key in ("reference_local_path", "generation_input"):
+            v = slot.get(key)
+            if not isinstance(v, str) or not v.strip():
+                continue
+            t = v.strip()
+            low = t.lower()
+            if low.startswith(("http://", "https://", "data:")):
+                continue
+            p = Path(t)
+            if not p.is_file():
+                continue
+            rp = str(p.resolve())
+            if rp in failures:
+                return False
+            if rp in src_to_dst:
+                slot[key] = src_to_dst[rp]
+    return True
+
+
+def _normalize_one_image_task(
+    args: Tuple[str, str, int],
+) -> Tuple[str, str, Optional[str], Optional[Tuple[int, int, int, int]]]:
+    """Return (src_abs, dst_abs, err, meta). meta is (orig_w, orig_h, scaled_w, scaled_h) on success."""
+    src_abs, dst_abs, side = args
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = None
+        try:
+            _resample = Image.Resampling.LANCZOS  # Pillow >= 9.1
+        except AttributeError:
+            _resample = Image.LANCZOS  # type: ignore[attr-defined]
+        def _as_rgb_on_white(src: Image.Image) -> Image.Image:
+            """Palette/RGBA/LA + alpha → RGB flattened on white; avoids PIL palette+transparency warnings."""
+            mode = src.mode
+            if mode in ("RGBA", "LA") or (mode == "P" and "transparency" in src.info):
+                rgba = src.convert("RGBA")
+                out = Image.new("RGB", rgba.size, (255, 255, 255))
+                out.paste(rgba, mask=rgba.split()[3])
+                return out
+            return src.convert("RGB")
+
+        with Image.open(src_abs) as im:
+            im.load()
+            im = _as_rgb_on_white(im)
+            w, h = im.size
+            if w <= 0 or h <= 0:
+                return src_abs, dst_abs, "non_positive_size", None
+            scale = min(float(side) / float(w), float(side) / float(h))
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            resized = im.resize((nw, nh), _resample)
+        canvas = Image.new("RGB", (side, side), (255, 255, 255))
+        ox = (side - nw) // 2
+        oy = (side - nh) // 2
+        canvas.paste(resized, (ox, oy))
+        Path(dst_abs).parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(dst_abs, format="PNG", optimize=True)
+    except Exception as e:
+        return src_abs, dst_abs, f"{type(e).__name__}: {e}", None
+    return src_abs, dst_abs, None, (w, h, nw, nh)
+
+
+def _normalize_jsonl_condition_images(
+    jsonl_path: Path,
+    dest_dir: Path,
+    *,
+    side: int,
+    workers: int,
+) -> None:
+    """
+    Rewrite ``jsonl_path`` so every ``image`` path points to a ``side`` x ``side`` RGB PNG
+    (aspect-preserving scale, centered on white) under ``dest_dir``. Rows that reference a
+    missing or failed source image are dropped.
+    """
+    try:
+        from tqdm import tqdm as _tqdm_norm
+    except ImportError:
+
+        def _tqdm_norm(it=None, **kwargs):  # type: ignore[misc]
+            return it if it is not None else []
+
+    lines = _read_nonempty_jsonl_lines(jsonl_path)
+    if not lines:
+        return
+    rows: List[Dict[str, Any]] = []
+    for line in lines:
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise TypeError(f"expected JSON object in {jsonl_path}, got {type(row).__name__}")
+        rows.append(row)
+
+    unique_src: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for p in _row_image_paths(row):
+            if p not in seen:
+                seen.add(p)
+                unique_src.append(p)
+
+    dest_dir = dest_dir.resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    tasks: List[Tuple[str, str, int]] = []
+    for src in unique_src:
+        h = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+        stem = Path(src).stem
+        safe_stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in stem)[:80]
+        dst = dest_dir / f"{h}_{safe_stem}.png"
+        tasks.append((src, str(dst), int(side)))
+
+    src_to_dst: Dict[str, str] = {}
+    failures: Dict[str, str] = {}
+    padding_examples: List[Tuple[str, str, int, int, int, int]] = []
+    n_cpu = os.cpu_count() or 8
+    w = workers if workers > 0 else min(32, n_cpu)
+
+    def _record_padding_example(s: str, d: str, meta: Tuple[int, int, int, int]) -> None:
+        ow, oh, nw, nh = meta
+        if len(padding_examples) >= 2:
+            return
+        if nw < side or nh < side:
+            padding_examples.append((s, d, ow, oh, nw, nh))
+
+    if w <= 1 or len(tasks) <= 1:
+        for t in _tqdm_norm(tasks, desc="Normalize condition images", unit="img"):
+            s, d, err, meta = _normalize_one_image_task(t)
+            if err:
+                failures[s] = err
+            else:
+                src_to_dst[s] = d
+                if meta is not None:
+                    _record_padding_example(s, d, meta)
+    else:
+        with ProcessPoolExecutor(max_workers=w) as ex:
+            futs = [ex.submit(_normalize_one_image_task, t) for t in tasks]
+            for fut in _tqdm_norm(as_completed(futs), total=len(futs), desc="Normalize condition images", unit="img"):
+                s, d, err, meta = fut.result()
+                if err:
+                    failures[s] = err
+                else:
+                    src_to_dst[s] = d
+                    if meta is not None:
+                        _record_padding_example(s, d, meta)
+
+    if padding_examples:
+        print(
+            f"[normalize] White-padding examples (source -> {side}×{side} PNG, orig -> scaled on canvas):",
+            file=sys.stderr,
+        )
+        for s, d, ow, oh, nw, nh in padding_examples:
+            print(f"  {s}", file=sys.stderr)
+            print(f"    -> {d}", file=sys.stderr)
+            print(f"    ({ow}×{oh} -> content {nw}×{nh} on {side}×{side} white)", file=sys.stderr)
+    else:
+        print(
+            f"[normalize] No white-padding examples to show (no sources needed letterboxing into {side}×{side}).",
+            file=sys.stderr,
+        )
+
+    if failures:
+        print(
+            f"[normalize] {len(failures)}/{len(tasks)} source images failed (rows referencing them will be dropped)",
+            file=sys.stderr,
+        )
+        for i, (s, e) in enumerate(sorted(failures.items())[:20]):
+            print(f"  - {s}: {e}", file=sys.stderr)
+        if len(failures) > 20:
+            print(f"  ... and {len(failures) - 20} more", file=sys.stderr)
+
+    kept_lines: List[str] = []
+    dropped = 0
+    for row in rows:
+        try:
+            srcs = _row_image_paths(row)
+        except TypeError:
+            dropped += 1
+            continue
+        if not srcs:
+            dropped += 1
+            continue
+        if any(s in failures for s in srcs):
+            dropped += 1
+            continue
+        if any(s not in src_to_dst for s in srcs):
+            dropped += 1
+            continue
+        new_paths = [src_to_dst[s] for s in srcs]
+        raw = row.get("image")
+        if isinstance(raw, str):
+            row["image"] = new_paths[0] if len(new_paths) == 1 else new_paths
+        else:
+            row["image"] = new_paths
+        if not _patch_eval_reference_slots_paths(row, src_to_dst, failures):
+            dropped += 1
+            continue
+        kept_lines.append(json.dumps(row, ensure_ascii=False))
+
+    _atomic_write_lines(jsonl_path, kept_lines)
+    print(
+        f"[normalize] wrote {len(src_to_dst)} files under {dest_dir}; "
+        f"jsonl {jsonl_path}: {len(kept_lines)} rows kept, {dropped} dropped",
+        file=sys.stderr,
+    )
 
 
 def _read_nonempty_jsonl_lines(path: Path) -> List[str]:
@@ -581,6 +825,38 @@ def main() -> None:
         default=0,
         help="prune process pool size (0 = min(32, CPUs)).",
     )
+    parser.add_argument(
+        "--normalize-condition-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resize/pad each condition image to a square white canvas (--normalize-size), rewrite JSONL paths "
+        "(default: true). Use --no-normalize-condition-images to skip.",
+    )
+    parser.add_argument(
+        "--normalize-size",
+        type=int,
+        default=512,
+        help="Output width/height for normalized condition images (default: 512).",
+    )
+    parser.add_argument(
+        "--normalize-subdir",
+        type=str,
+        default="condition_images_512",
+        help="Subdir under the parent of --output for PNGs (default: condition_images_512). Ignored if "
+        "--normalize-dest-dir is set.",
+    )
+    parser.add_argument(
+        "--normalize-dest-dir",
+        type=Path,
+        default=None,
+        help="Absolute output directory for normalized PNGs (default: <output-parent>/<normalize-subdir>).",
+    )
+    parser.add_argument(
+        "--normalize-workers",
+        type=int,
+        default=0,
+        help="Parallel workers for normalization (0 = min(32, CPUs); 1 = serial).",
+    )
     args = parser.parse_args()
 
     toolgen_root = args.toolgen_root.resolve()
@@ -646,19 +922,23 @@ def main() -> None:
     train_path = out_path
     test_path = (args.test_output or train_path.parent / "test.jsonl").resolve()
     n_test = int(args.test_count)
-    if n_test > 0:
-        _split_train_test(
+
+    # 1) Normalize condition images into dataset folder; rewrite JSONL to new paths; drop bad rows.
+    if bool(args.normalize_condition_images):
+        nd = args.normalize_dest_dir
+        if nd is None:
+            nd = train_path.parent / str(args.normalize_subdir)
+        else:
+            nd = Path(nd).resolve()
+        _normalize_jsonl_condition_images(
             train_path,
-            test_count=n_test,
-            test_path=test_path,
-            random_split=bool(args.split_random),
-            seed=int(args.split_seed) if args.split_seed is not None else None,
+            nd,
+            side=int(args.normalize_size),
+            workers=int(args.normalize_workers),
         )
 
+    # 2) Prune broken / oversize references on the combined file *before* train/test split so test size is exact.
     if not args.no_prune:
-        to_prune: List[Path] = [train_path]
-        if n_test > 0 and test_path.is_file():
-            to_prune.append(test_path)
         img_d = args.prune_image_dir
         if img_d is None:
             img_d = train_path.parent / "images"
@@ -671,11 +951,26 @@ def main() -> None:
         pp = int(args.prune_drop_pixels_percentile)
         pct: Optional[int] = None if pp <= 0 else pp
         _run_prune_jsonl(
-            to_prune,
+            [train_path],
             image_dir=img_d,
             prune_workers=pw,
             max_images=max_im,
             drop_pixels_percentile=pct,
+        )
+
+    if n_test > 0:
+        n_kept = len(_read_nonempty_jsonl_lines(train_path))
+        if n_kept < n_test:
+            raise SystemExit(
+                f"train/test split: need at least {n_test} rows after normalize+prune "
+                f"(for test set size), got {n_kept} — {train_path}"
+            )
+        _split_train_test(
+            train_path,
+            test_count=n_test,
+            test_path=test_path,
+            random_split=bool(args.split_random),
+            seed=int(args.split_seed) if args.split_seed is not None else None,
         )
 
     t_tr, t_tot = _count_text_ref_rows_in_jsonl(train_path)
