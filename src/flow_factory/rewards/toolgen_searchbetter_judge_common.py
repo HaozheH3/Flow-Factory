@@ -22,6 +22,11 @@ still parsed for backward compatibility with older model outputs.
 Aligned with ``phase5_data_collection/evaluate_searchbetter_hard_direct.py`` and
 real saved prompts such as ``.../augmented_prompt_context.txt`` (same Instructions
 block, Evaluation context headers, interleaved reference context lines).
+
+Training contract: the judge ``Task prompt`` / instructions ``user_prompt`` field comes from
+``row["user_prompt"]`` and must be the **original** user task (checklist + rubric + faithfulness).
+The phase4 **refined** prompt is **not** read here; it belongs on the training sample as ``prompt``
+for the generator only (see :func:`build_eval_prompt_text`).
 """
 
 from __future__ import annotations
@@ -468,6 +473,17 @@ def build_eval_prompt_text(
     variant: str,
     reference_slot_urls: Sequence[str],
 ) -> str:
+    """
+    Build the judge user-text block (instructions + evaluation context).
+
+    ``row["user_prompt"]`` must be the **original** user-facing task string. ToolGen checklist and
+    rubric are defined against that text, and ``prompt_faithfulness`` in the judge protocol means
+    alignment with this instruction — not the phase4 **refined** prompt used only as the generator's
+    conditioning text (stored separately on training samples as ``prompt`` in JSONL / dataset rows).
+
+    Callers (e.g. :class:`~flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeRewardModel`)
+    must keep that split: refined prompt → policy ``prompt``; original → ``user_prompt`` here.
+    """
     checklist = list(verification_checklist)
     rubric = normalize_rubric(evaluation_rubric)
     reference_counts = get_reference_count_fields_from_row(row)
@@ -1881,8 +1897,9 @@ def reference_slot_placeholders(n: int) -> List[str]:
 
 
 def coerce_ref_image_list(condition_images_entry: Any) -> List[Image.Image]:
+    """Normalize one batch element to a list of PIL images. Empty list = text-to-image (no reference slots)."""
     if condition_images_entry is None:
-        raise ValueError("condition_images entry is None; need at least one reference image")
+        return []
     if isinstance(condition_images_entry, Image.Image):
         return [condition_images_entry]
     if isinstance(condition_images_entry, list):
@@ -1894,8 +1911,6 @@ def coerce_ref_image_list(condition_images_entry: Any) -> List[Image.Image]:
                     f"got {type(x).__name__} at index {j}"
                 )
             out.append(x)
-        if not out:
-            raise ValueError("condition_images entry is an empty list")
         return out
     raise TypeError(
         f"expected PIL.Image.Image or list of PIL images for condition_images element, "

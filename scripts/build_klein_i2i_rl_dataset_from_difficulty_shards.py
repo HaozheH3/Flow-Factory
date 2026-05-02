@@ -5,52 +5,46 @@
 # you may not use this file except in compliance with the License.
 
 """
-Build Flow-Factory Klein i2i JSONL for NFT + ``toolgen_searchbetter_judge*`` rewards.
+Build Flow-Factory Klein i2i / mixed T2I+I2I JSONL for NFT + ``toolgen_searchbetter_judge*`` rewards.
 
 Plan
 ----
-1. **Source A — difficulty shards** (``difficulty_label_shards/*.json``): each file is one labeled row
-   with ``difficulty_label.difficulty_with_ideal_visual_references`` and the same layout as
-   ``collect_prompt_eval_dataset.py`` (``user_prompt``, ``evaluation_context``, ``phase4.run_dir``).
+1. **Source** (pick one):
+   - **Labeled JSONL** (default): ``phase2_prompt_generation/AA_synth_all_prompts_metadata_eval.difficulty_labeled.jsonl``
+     — one object per line, same keys as legacy shards (``user_prompt``, ``evaluation_context``,
+     ``phase4.run_dir``, ``difficulty_label``, …).
+   - **Legacy shards**: ``difficulty_label_shards/*.json`` via ``--shard-dir``.
 
 2. **Filter**: keep rows with ``difficulty_with_ideal_visual_references >= --min-visual-difficulty``
-   (default 3.5).
 
-3. **Source B — phase4 run** (same roots as ``phase6_sft/run_collect_and_label_prompt_difficulty.sh`` →
-   ``scripts/collect_prompt_eval_dataset.py``): require ``generation_params.json`` under ``run_dir``.
+3. **Phase4 run**: require ``generation_params.json`` under ``run_dir``.
 
-4. **Resolve reference images** for ``GeneralDataset`` ``image`` column (loaded as conditioning):
-   **First** read ``reference_eval_lookup.json`` under ``run_dir`` when valid (ToolGen
-   ``try_load_reference_eval_lookup`` — same pre-resolved ``eval_reference_slots`` as phase5 judge).
-   If missing or empty, **rebuild** slots with ``build_eval_reference_slots_from_generation_params``.
-   Final fallback: ``run_dir/reference_images/*`` on disk.
+4. **Mixed T2I + I2I** (``--mix-t2i-i2i``, default on): if ``reference_images`` is empty, emit a **T2I**
+   row (``image``: ``[]``, ``task_mode``: ``t2i``). Otherwise resolve conditioning refs like before
+   (``task_mode``: ``i2i``).
 
-5. **Output schema** — ``prompt``, ``image`` (abs paths list), ``user_prompt``, checklist,
-   ``evaluation_rubric`` as a **JSON string** (per-row rubric keys differ; a string column avoids
-   HuggingFace Arrow struct merge failures in ``GeneralDataset``), ``trajectory_id``,
-   ``request_index``,    ``augmented_generation_details`` with ``eval_reference_slots`` (I2I paths from
-   ``generation_params.json`` in order, joined to ``analysis`` + ``reference_selection_*.json`` for
-   entity/reasoning), etc.
+5. **Prompts**: ``prompt`` = **refined** text for the generator (``refined_prompt.txt`` →
+   ``refined_prompt.json`` → ``generation_params.prompt``). ``user_prompt`` = **original** task
+   from the labeled record (for the judge).
 
-**Parallelism**: default ``--workers`` uses ``min(32, os.cpu_count() or 8)``. Workers run
-``_shard_worker_task`` (spawn-safe). Output order follows sorted shard filenames (``Pool.imap``).
-Use ``--workers 1`` to disable multiprocessing (still shows tqdm when tqdm is installed).
+6. **Output schema** — ``prompt``, ``image`` (abs paths list, possibly empty), ``user_prompt``,
+   ``task_mode``, checklist, ``evaluation_rubric`` JSON string, ``trajectory_id``, ``request_index``,
+   ``augmented_generation_details`` (``eval_reference_slots``, ``eval_text_knowledge_slots``, …).
 
-**Post steps** (same run, in order): **normalize** condition images to ``--normalize-size`` (white
-letterbox) under ``<output-parent>/<normalize-subdir>/``, rewrite ``image`` and
-``augmented_generation_details.eval_reference_slots`` paths; **prune** the combined JSONL via
-``prune_jsonl_broken_reference_images.py``; then **train/test split** (``--test-count``, default 64)
-so the test set has exactly that many rows if enough remain after drops. Web knowledge
-``eval_text_knowledge_slots`` is filled from analysis (see ToolGen
-``build_eval_text_knowledge_slots_from_analysis``).
+Post steps: normalize (I2I rows only touch images), prune with ``--allow-empty-images`` when mixing,
+train/test split.
 
 Usage
 -----
   PYTHONPATH=src python scripts/build_klein_i2i_rl_dataset_from_difficulty_shards.py \\
-    --shard-dir .../difficulty_label_shards \\
-    --output dataset/klein_i2i_hard_visual_35/train.jsonl
+    --output dataset/klein_i2i_mix_visual_ge_35_v4/train.jsonl
 
-Or: ``bash scripts/build_klein_i2i_rl_dataset.sh`` (see that file for ``OUTPUT_JSONL`` / ``WORKERS`` env vars).
+  # Legacy shards:
+  PYTHONPATH=src python scripts/build_klein_i2i_rl_dataset_from_difficulty_shards.py \\
+    --shard-dir .../difficulty_label_shards \\
+    --output dataset/legacy/train.jsonl
+
+Or: ``bash scripts/build_klein_i2i_rl_dataset.sh``
 """
 
 from __future__ import annotations
@@ -170,6 +164,8 @@ def _visual_difficulty(record: Dict[str, Any]) -> Optional[float]:
 def _resolve_local_reference_paths(
     run_dir: Path,
     ev: Any,
+    *,
+    mix_allow_empty: bool,
 ) -> Tuple[List[str], Optional[str], str]:
     lookup_slots = ev.try_load_reference_eval_lookup(run_dir, force_refresh=False)
     if isinstance(lookup_slots, list) and lookup_slots:
@@ -182,6 +178,8 @@ def _resolve_local_reference_paths(
         return [], "missing_or_invalid_generation_params.json", "none"
     gen_refs = ev.normalized_reference_urls_from_params(gp)
     if not gen_refs:
+        if mix_allow_empty:
+            return [], None, "none"
         return [], "generation_params.reference_images_empty", "none"
     ref_rows = ev.load_reference_selection_rows(run_dir)
     analysis_json = _read_json(run_dir / "analysis.json")
@@ -208,20 +206,26 @@ def _resolve_local_reference_paths(
                     seen.add(abs_p)
                     locals_out.append(abs_p)
     if not locals_out:
+        if mix_allow_empty:
+            return [], None, "none"
         return [], "no_local_reference_paths_resolved", "none"
     return locals_out, None, "reference_images_dir"
 
 
-def _prompt_from_run(run_dir: Path, gp: Dict[str, Any]) -> str:
-    p = str(gp.get("prompt") or "").strip()
-    if p:
-        return p
-    rp = run_dir / "refined_prompt.txt"
-    if rp.is_file():
-        t = rp.read_text(encoding="utf-8").strip()
+def _refined_prompt_from_run(run_dir: Path, gp: Dict[str, Any]) -> str:
+    """Generator conditioning: refined prompt files first, then generation_params.prompt."""
+    rp_txt = run_dir / "refined_prompt.txt"
+    if rp_txt.is_file():
+        t = rp_txt.read_text(encoding="utf-8").strip()
         if t:
             return t
-    return ""
+    rp_json = run_dir / "refined_prompt.json"
+    raw_j = _read_json(rp_json)
+    if isinstance(raw_j, dict):
+        v = raw_j.get("refined_prompt")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return str(gp.get("prompt") or "").strip()
 
 
 def _augmented_details(run_dir: Path, ev: Any, n_refs: int, generation_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,16 +265,20 @@ def _augmented_details(run_dir: Path, ev: Any, n_refs: int, generation_params: D
 def _empty_stats() -> Dict[str, int]:
     return {
         "shard_files_seen": 0,
+        "jsonl_lines_seen": 0,
         "passed_difficulty_filter": 0,
         "missing_run_dir": 0,
         "missing_generation_params": 0,
         "unresolved_refs": 0,
         "empty_prompt": 0,
         "skipped_no_eval_context": 0,
+        "skipped_bad_jsonl": 0,
         "ref_paths_from_reference_eval_lookup": 0,
         "ref_paths_from_generation_params_rebuild": 0,
         "ref_paths_from_reference_images_dir": 0,
         "rows_with_text_references": 0,
+        "rows_t2i": 0,
+        "rows_i2i": 0,
     }
 
 
@@ -346,7 +354,7 @@ def _normalize_one_image_task(
         except AttributeError:
             _resample = Image.LANCZOS  # type: ignore[attr-defined]
         def _as_rgb_on_white(src: Image.Image) -> Image.Image:
-            """Palette/RGBA/LA + alpha → RGB flattened on white; avoids PIL palette+transparency warnings."""
+            """Palette/RGBA/LA + alpha to RGB flattened on white; avoids PIL palette+transparency warnings."""
             mode = src.mode
             if mode in ("RGBA", "LA") or (mode == "P" and "transparency" in src.info):
                 rgba = src.convert("RGBA")
@@ -492,7 +500,10 @@ def _normalize_jsonl_condition_images(
             dropped += 1
             continue
         if not srcs:
-            dropped += 1
+            if not _patch_eval_reference_slots_paths(row, src_to_dst, failures):
+                dropped += 1
+                continue
+            kept_lines.append(json.dumps(row, ensure_ascii=False))
             continue
         if any(s in failures for s in srcs):
             dropped += 1
@@ -606,6 +617,7 @@ def _run_prune_jsonl(
     prune_workers: int,
     max_images: Optional[int],
     drop_pixels_percentile: Optional[int],
+    allow_empty_images: bool,
 ) -> None:
     existing = [p for p in jsonl_paths if p.is_file()]
     if not existing:
@@ -623,6 +635,8 @@ def _run_prune_jsonl(
         "--workers",
         str(prune_workers),
     ]
+    if allow_empty_images:
+        cmd.append("--allow-empty-images")
     if max_images is not None:
         cmd.extend(["--max-images", str(max_images)])
     if drop_pixels_percentile is not None:
@@ -631,18 +645,15 @@ def _run_prune_jsonl(
     subprocess.check_call(cmd)
 
 
-def _build_row_from_shard(
-    shard_path: Path,
-    toolgen_root: Path,
+def _build_row_from_labeled_record(
+    rec: Dict[str, Any],
+    *,
+    default_trajectory_stem: str,
     min_visual_difficulty: float,
     ev: Any,
+    mix_t2i_i2i: bool,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     st = _empty_stats()
-    st["shard_files_seen"] = 1
-
-    rec = _load_shard_record(shard_path)
-    if rec is None:
-        return None, st
 
     score = _visual_difficulty(rec)
     if score is None or score < min_visual_difficulty:
@@ -675,7 +686,7 @@ def _build_row_from_shard(
         st["missing_generation_params"] = 1
         return None, st
 
-    local_refs, err, ref_src = _resolve_local_reference_paths(run_dir, ev)
+    local_refs, err, ref_src = _resolve_local_reference_paths(run_dir, ev, mix_allow_empty=mix_t2i_i2i)
     if err:
         st["unresolved_refs"] = 1
         return None, st
@@ -686,10 +697,15 @@ def _build_row_from_shard(
     elif ref_src == "reference_images_dir":
         st["ref_paths_from_reference_images_dir"] = 1
 
-    prompt = _prompt_from_run(run_dir, gp)
+    prompt = _refined_prompt_from_run(run_dir, gp)
     if not prompt.strip():
         st["empty_prompt"] = 1
         return None, st
+
+    if local_refs:
+        st["rows_i2i"] = 1
+    else:
+        st["rows_t2i"] = 1
 
     checklist = evc.get("verification_checklist")
     if not isinstance(checklist, list):
@@ -698,12 +714,14 @@ def _build_row_from_shard(
 
     mri = rec.get("metadata_row_index")
     req_idx = int(mri) if isinstance(mri, int) else -1
-    sid = str(rec.get("sample_id") or "").strip() or shard_path.stem
+    sid = str(rec.get("sample_id") or "").strip() or default_trajectory_stem
 
+    task_mode = "i2i" if local_refs else "t2i"
     row: Dict[str, Any] = {
         "prompt": prompt,
         "image": local_refs,
         "user_prompt": str(rec.get("user_prompt") or "").strip(),
+        "task_mode": task_mode,
         "verification_checklist": [str(x) for x in checklist if isinstance(x, str) and x.strip()],
         "evaluation_rubric": json.dumps(rubric, ensure_ascii=False),
         "trajectory_id": sid,
@@ -724,15 +742,71 @@ def _build_row_from_shard(
     return row, st
 
 
-def _shard_worker_task(task: Tuple[str, str, float]) -> Dict[str, Any]:
-    """Picklable worker: (shard_path_str, toolgen_root_str, min_visual_difficulty)."""
-    shard_path_str, toolgen_root_str, min_vis = task
+def _build_row_from_shard(
+    shard_path: Path,
+    toolgen_root: Path,
+    min_visual_difficulty: float,
+    ev: Any,
+    *,
+    mix_t2i_i2i: bool,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
+    st_head = _empty_stats()
+    st_head["shard_files_seen"] = 1
+    rec = _load_shard_record(shard_path)
+    if rec is None:
+        return None, st_head
+    row, st = _build_row_from_labeled_record(
+        rec,
+        default_trajectory_stem=shard_path.stem,
+        min_visual_difficulty=min_visual_difficulty,
+        ev=ev,
+        mix_t2i_i2i=mix_t2i_i2i,
+    )
+    st["shard_files_seen"] = 1
+    return row, st
+
+
+def _shard_worker_task(task: Tuple[str, str, float, int]) -> Dict[str, Any]:
+    """Picklable worker: (shard_path_str, toolgen_root_str, min_visual_difficulty, mix_as_int)."""
+    shard_path_str, toolgen_root_str, min_vis, mix_i = task
     shard_path = Path(shard_path_str)
     toolgen_root = Path(toolgen_root_str)
     _ensure_toolgen_phase5_on_path(toolgen_root)
     import evaluate_searchbetter_hard_direct as ev  # type: ignore[import-not-found]
 
-    row, st = _build_row_from_shard(shard_path, toolgen_root, min_vis, ev)
+    row, st = _build_row_from_shard(
+        shard_path, toolgen_root, min_vis, ev, mix_t2i_i2i=bool(mix_i)
+    )
+    return {"row": row, "stats": st}
+
+
+def _jsonl_worker_task(task: Tuple[str, str, float, int]) -> Dict[str, Any]:
+    """Picklable worker: (line_str, toolgen_root_str, min_visual_difficulty, mix_as_int)."""
+    line_str, toolgen_root_str, min_vis, mix_i = task
+    toolgen_root = Path(toolgen_root_str)
+    st = _empty_stats()
+    st["jsonl_lines_seen"] = 1
+    try:
+        rec = json.loads(line_str)
+    except json.JSONDecodeError:
+        st["skipped_bad_jsonl"] = 1
+        return {"row": None, "stats": st}
+    if not isinstance(rec, dict):
+        st["skipped_bad_jsonl"] = 1
+        return {"row": None, "stats": st}
+    _ensure_toolgen_phase5_on_path(toolgen_root)
+    import evaluate_searchbetter_hard_direct as ev  # type: ignore[import-not-found]
+
+    stem = str(rec.get("sample_id") or "").strip() or hashlib.sha256(line_str.encode()).hexdigest()[:16]
+    row, st2 = _build_row_from_labeled_record(
+        rec,
+        default_trajectory_stem=stem,
+        min_visual_difficulty=float(min_vis),
+        ev=ev,
+        mix_t2i_i2i=bool(mix_i),
+    )
+    for k, v in st2.items():
+        st[k] = st.get(k, 0) + v
     return {"row": row, "stats": st}
 
 
@@ -754,7 +828,30 @@ def main() -> None:
         "--shard-dir",
         type=Path,
         default=None,
-        help="Directory of per-row *.json shards (default: TOOLGEN_ROOT/phase2_prompt_generation/difficulty_label_shards)",
+        help="Use per-row *.json shards under this directory (exclusive with default labeled-jsonl source).",
+    )
+    parser.add_argument(
+        "--labeled-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "ToolGen difficulty-labeled JSONL (one object per line). "
+            "Default when --shard-dir omitted: "
+            "TOOLGEN_ROOT/phase2_prompt_generation/AA_synth_all_prompts_metadata_eval.difficulty_labeled.jsonl"
+        ),
+    )
+    parser.add_argument(
+        "--max-jsonl-lines",
+        type=int,
+        default=0,
+        help="Process only the first N nonempty JSONL lines (0 = all). Dev shortcut.",
+    )
+    parser.set_defaults(mix_t2i_i2i=True)
+    parser.add_argument(
+        "--no-mix-t2i-i2i",
+        action="store_false",
+        dest="mix_t2i_i2i",
+        help="Require reference images for every row (drop text-to-image runs).",
     )
     parser.add_argument("--output", type=Path, required=True, help="Output JSONL path (parent created).")
     parser.add_argument("--min-visual-difficulty", type=float, default=3.5)
@@ -781,8 +878,8 @@ def main() -> None:
     parser.add_argument(
         "--test-count",
         type=int,
-        default=32,
-        help="After writing --output, move this many lines to a test set (0 = no split). Default: 32.",
+        default=64,
+        help="After writing --output, move this many lines to a test set (0 = no split). Default: 64.",
     )
     parser.add_argument(
         "--test-output",
@@ -860,60 +957,114 @@ def main() -> None:
     args = parser.parse_args()
 
     toolgen_root = args.toolgen_root.resolve()
-    shard_dir = (
-        args.shard_dir.resolve()
-        if args.shard_dir is not None
-        else (toolgen_root / "phase2_prompt_generation" / "difficulty_label_shards").resolve()
-    )
-    if not shard_dir.is_dir():
-        raise SystemExit(f"shard-dir is not a directory: {shard_dir}")
-
-    paths = _list_shard_paths(shard_dir)
-    if args.max_shard_files and args.max_shard_files > 0:
-        paths = paths[: args.max_shard_files]
-
+    mix_flag = bool(args.mix_t2i_i2i)
+    mix_i = 1 if mix_flag else 0
     out_path = args.output.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_cpu = os.cpu_count() or 8
     workers = args.workers if args.workers > 0 else min(32, n_cpu)
     cap = args.max_rows if args.max_rows and args.max_rows > 0 else None
-
-    tasks = [(str(p.resolve()), str(toolgen_root), float(args.min_visual_difficulty)) for p in paths]
     stats_total = _empty_stats()
     written = 0
 
-    if workers <= 1:
-        _ensure_toolgen_phase5_on_path(toolgen_root)
-        import evaluate_searchbetter_hard_direct as ev  # type: ignore[import-not-found]
+    if args.shard_dir is not None:
+        shard_dir = args.shard_dir.resolve()
+        if not shard_dir.is_dir():
+            raise SystemExit(f"shard-dir is not a directory: {shard_dir}")
+        paths = _list_shard_paths(shard_dir)
+        if args.max_shard_files and args.max_shard_files > 0:
+            paths = paths[: args.max_shard_files]
 
-        it = paths if args.no_progress else tqdm(paths, desc="Shards", unit="file")
-        with out_path.open("w", encoding="utf-8") as out_f:
-            for shard_path in it:
-                row, st = _build_row_from_shard(shard_path, toolgen_root, args.min_visual_difficulty, ev)
-                _merge_stats(stats_total, st)
-                if row is None:
-                    continue
-                if cap is not None and written >= cap:
-                    continue
-                out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                written += 1
+        tasks = [
+            (str(p.resolve()), str(toolgen_root), float(args.min_visual_difficulty), mix_i) for p in paths
+        ]
+        if workers <= 1:
+            _ensure_toolgen_phase5_on_path(toolgen_root)
+            import evaluate_searchbetter_hard_direct as ev  # type: ignore[import-not-found]
+
+            it = paths if args.no_progress else tqdm(paths, desc="Shards", unit="file")
+            with out_path.open("w", encoding="utf-8") as out_f:
+                for shard_path in it:
+                    row, st = _build_row_from_shard(
+                        shard_path, toolgen_root, args.min_visual_difficulty, ev, mix_t2i_i2i=mix_flag
+                    )
+                    _merge_stats(stats_total, st)
+                    if row is None:
+                        continue
+                    if cap is not None and written >= cap:
+                        continue
+                    out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
+        else:
+            chunksize = max(1, len(tasks) // (workers * 8)) if tasks else 1
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=workers) as pool, out_path.open("w", encoding="utf-8") as out_f:
+                imap_it = pool.imap(_shard_worker_task, tasks, chunksize=chunksize)
+                if not args.no_progress:
+                    imap_it = tqdm(imap_it, total=len(tasks), desc="Shards", unit="file")
+                for pack in imap_it:
+                    _merge_stats(stats_total, pack["stats"])
+                    row = pack.get("row")
+                    if row is None:
+                        continue
+                    if cap is not None and written >= cap:
+                        continue
+                    out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
     else:
-        chunksize = max(1, len(tasks) // (workers * 8)) if tasks else 1
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=workers) as pool, out_path.open("w", encoding="utf-8") as out_f:
-            imap_it = pool.imap(_shard_worker_task, tasks, chunksize=chunksize)
-            if not args.no_progress:
-                imap_it = tqdm(imap_it, total=len(tasks), desc="Shards", unit="file")
-            for pack in imap_it:
-                _merge_stats(stats_total, pack["stats"])
-                row = pack.get("row")
-                if row is None:
-                    continue
-                if cap is not None and written >= cap:
-                    continue
-                out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                written += 1
+        labeled_path = (
+            args.labeled_jsonl.resolve()
+            if args.labeled_jsonl is not None
+            else (
+                toolgen_root / "phase2_prompt_generation" / "AA_synth_all_prompts_metadata_eval.difficulty_labeled.jsonl"
+            ).resolve()
+        )
+        if not labeled_path.is_file():
+            raise SystemExit(f"labeled-jsonl not found: {labeled_path}\nPass --shard-dir for shard mode.")
+        raw_lines: List[str] = []
+        with labeled_path.open(encoding="utf-8") as lf:
+            for line in lf:
+                s = line.strip()
+                if s:
+                    raw_lines.append(s)
+        if args.max_jsonl_lines and args.max_jsonl_lines > 0:
+            raw_lines = raw_lines[: int(args.max_jsonl_lines)]
+
+        tasks = [
+            (ln, str(toolgen_root), float(args.min_visual_difficulty), mix_i) for ln in raw_lines
+        ]
+        if workers <= 1:
+            it = raw_lines if args.no_progress else tqdm(raw_lines, desc="JSONL", unit="line")
+            with out_path.open("w", encoding="utf-8") as out_f:
+                for line_str in it:
+                    pack = _jsonl_worker_task(
+                        (line_str, str(toolgen_root), float(args.min_visual_difficulty), mix_i)
+                    )
+                    _merge_stats(stats_total, pack["stats"])
+                    row = pack.get("row")
+                    if row is None:
+                        continue
+                    if cap is not None and written >= cap:
+                        continue
+                    out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
+        else:
+            chunksize = max(1, len(tasks) // (workers * 8)) if tasks else 1
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=workers) as pool, out_path.open("w", encoding="utf-8") as out_f:
+                imap_it = pool.imap(_jsonl_worker_task, tasks, chunksize=chunksize)
+                if not args.no_progress:
+                    imap_it = tqdm(imap_it, total=len(tasks), desc="JSONL", unit="line")
+                for pack in imap_it:
+                    _merge_stats(stats_total, pack["stats"])
+                    row = pack.get("row")
+                    if row is None:
+                        continue
+                    if cap is not None and written >= cap:
+                        continue
+                    out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += 1
 
     stats_total["written"] = written
     print(json.dumps(stats_total, indent=2))
@@ -956,6 +1107,7 @@ def main() -> None:
             prune_workers=pw,
             max_images=max_im,
             drop_pixels_percentile=pct,
+            allow_empty_images=mix_flag,
         )
 
     if n_test > 0:

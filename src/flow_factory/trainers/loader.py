@@ -18,8 +18,10 @@ Trainer loader factory for extensibility.
 Supports multiple RL algorithms via registry pattern.
 """
 import os
+from datetime import timedelta
+
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import InitProcessGroupKwargs, ProjectConfiguration, set_seed
 import logging
 
 from ..models.loader import load_model
@@ -61,11 +63,25 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.log_args.save_dir, config.log_args.run_name),
     )
+
+    kwargs_handlers: list = [ddp_kwargs]
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        # Accelerate defaults to 600s for NCCL ; API-bound rewards (e.g. Frontier judge) often
+        # skew across ranks and block wait_for_everyone() longer. Override via env when needed.
+        timeout_sec = int(os.environ.get("FLOW_FACTORY_PROCESS_GROUP_TIMEOUT_SEC", "3600"))
+        kwargs_handlers.append(InitProcessGroupKwargs(timeout=timedelta(seconds=timeout_sec)))
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            logger.info(
+                "Multi-GPU: process group timeout %ss (set FLOW_FACTORY_PROCESS_GROUP_TIMEOUT_SEC to override)",
+                timeout_sec,
+            )
+
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
         gradient_accumulation_steps=config.training_args.gradient_accumulation_steps,
-        kwargs_handlers=[ddp_kwargs],
+        kwargs_handlers=kwargs_handlers,
     )
     set_seed(config.training_args.seed, device_specific=True)
 

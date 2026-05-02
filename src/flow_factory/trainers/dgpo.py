@@ -22,6 +22,7 @@ Reference:
 """
 
 import os
+import traceback
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
@@ -800,6 +801,7 @@ class DGPOTrainer(BaseTrainer):
                 samples = self.sample()
 
             self.prepare_feedback(samples)
+            self._gather_train_samples_and_maybe_dump(samples)
             self.optimize(samples)
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
@@ -813,51 +815,69 @@ class DGPOTrainer(BaseTrainer):
         self.adapter.eval()
         self.eval_reward_buffer.clear()
 
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[BaseSample] = []
+        all_samples: List[BaseSample] = []
+        gathered_rewards: Dict[str, np.ndarray] = {}
+        eval_status = "ok"
+        eval_err_tb: Optional[str] = None
 
-            for batch in tqdm(
-                self.test_dataloader,
-                desc="Evaluating",
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
-                inference_kwargs = {
-                    "compute_log_prob": False,
-                    "generator": generator,
-                    "trajectory_indices": None,
-                    **self.eval_args,
+        try:
+            with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
+                for batch in tqdm(
+                    self.test_dataloader,
+                    desc="Evaluating",
+                    disable=not self.show_progress_bar,
+                ):
+                    generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
+                    inference_kwargs = {
+                        "compute_log_prob": False,
+                        "generator": generator,
+                        "trajectory_indices": None,
+                        **self.eval_args,
+                    }
+                    inference_kwargs.update(**batch)
+                    inference_kwargs = self._materialize_jsonl_images_for_adapter_inference(
+                        inference_kwargs
+                    )
+                    inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
+                    samples = self.adapter.inference(**inference_kwargs)
+                    all_samples.extend(samples)
+                    self.eval_reward_buffer.add_samples(samples)
+
+                rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
+                rewards = {
+                    key: torch.as_tensor(value).to(self.accelerator.device)
+                    for key, value in rewards.items()
                 }
-                inference_kwargs.update(**batch)
-                inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                samples = self.adapter.inference(**inference_kwargs)
-                all_samples.extend(samples)
-                self.eval_reward_buffer.add_samples(samples)
+                gathered_rewards = {}
+                for key, value in rewards.items():
+                    gathered: torch.Tensor = self.accelerator.gather(value)  # type: ignore[assignment]
+                    gathered_rewards[key] = gathered.cpu().numpy()
 
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
-            rewards = {
-                key: torch.as_tensor(value).to(self.accelerator.device)
-                for key, value in rewards.items()
-            }
-            gathered_rewards: Dict[str, np.ndarray] = {}
-            for key, value in rewards.items():
-                gathered: torch.Tensor = self.accelerator.gather(value)  # type: ignore[assignment]
-                gathered_rewards[key] = gathered.cpu().numpy()
-
-            if self.accelerator.is_main_process:
-                log_data: Dict[str, Any] = {
-                    f"eval/reward_{key}_mean": np.mean(value)
-                    for key, value in gathered_rewards.items()
-                }
-                log_data.update(
-                    {
-                        f"eval/reward_{key}_std": np.std(value)
+                if self.accelerator.is_main_process:
+                    log_data: Dict[str, Any] = {
+                        f"eval/reward_{key}_mean": np.mean(value)
                         for key, value in gathered_rewards.items()
                     }
-                )
-                log_data["eval_samples"] = all_samples
-                self.log_data(log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
+                    log_data.update(
+                        {
+                            f"eval/reward_{key}_std": np.std(value)
+                            for key, value in gathered_rewards.items()
+                        }
+                    )
+                    log_data["eval_samples"] = all_samples
+                    self.log_data(log_data, step=self.step)
+                self.accelerator.wait_for_everyone()
+        except Exception:
+            eval_status = "error"
+            eval_err_tb = traceback.format_exc()
+            raise
+        finally:
+            self._gather_eval_samples_and_maybe_dump(
+                all_samples,
+                gathered_rewards,
+                status=eval_status,
+                error_traceback=eval_err_tb,
+            )
 
     # =========================== Sampling (Stages 2-3) ============================
     def sample(self) -> List[BaseSample]:

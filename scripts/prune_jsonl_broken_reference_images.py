@@ -46,6 +46,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import shutil
 import statistics
 from concurrent.futures import ProcessPoolExecutor
@@ -354,9 +355,13 @@ def main() -> None:
     big_paths: Set[str] = set()
     if drop_pc is not None:
         if not path_wh:
-            raise SystemExit(
-                "No decodable image paths: cannot apply --drop-pixels-above-percentile"
+            print(
+                "[prune] No decodable image paths; skipping --drop-pixels-above-percentile "
+                "(e.g. all rows are text-to-image with empty `image`).",
+                file=sys.stderr,
             )
+            drop_pc = None
+    if drop_pc is not None:
         pixel_counts = [wh[0] * wh[1] for wh in path_wh.values()]
         srt_pc = sorted(pixel_counts)
         pixel_threshold = _percentile_linear(srt_pc, float(drop_pc))

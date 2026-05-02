@@ -21,6 +21,9 @@ ToolGen SearchBetter-style multimodal judge rewards.
 
 Prompt text and interleaved image layout match ``evaluate_searchbetter_hard_direct.py`` and saved
 ``*_prompt_context.txt`` files from phase5 evaluation runs.
+
+Contract: sample ``prompt`` → generator (typically **refined**); sample ``user_prompt`` → judge Task
+prompt (**original** user instruction). See :func:`build_eval_prompt_text`.
 """
 
 from __future__ import annotations
@@ -161,6 +164,11 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
     """
     Pointwise i2i reward via remote multimodal judge (OpenAI-compatible chat completions).
 
+    Sample fields split: ``prompt`` is the policy / generator conditioning text (typically the **refined**
+    prompt from the phase4 run). ``user_prompt`` is the **original** task string and is what the judge
+    uses as "Task prompt" (checklist and rubric apply to that text). Do not pass refined text in
+    ``user_prompt``.
+
     ``extra_kwargs`` (subset): ``api_base_url``, ``api_key``, ``vlm_model``, ``max_concurrent``,
     ``max_retries``, ``timeout``, ``temperature``, ``max_tokens``, ``max_pixels`` (per image_url,
     default ``589824``), ``variant`` (string tag in the evaluation context, default ``training``).
@@ -251,14 +259,14 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
             image = [frames[0] for frames in video]
         if image is None:
             raise ValueError("Either 'image' or 'video' must be provided for ToolGenSearchBetterJudge")
+        batch_len = len(prompt)
         if condition_images is None:
-            raise ValueError("condition_images is required for ToolGenSearchBetterJudge")
+            condition_images = [None] * batch_len
         if user_prompt is None:
             raise ValueError(
                 "user_prompt is required (store on each sample, e.g. via extra_kwargs from JSONL)."
             )
 
-        batch_len = len(prompt)
         if len(image) != batch_len or len(condition_images) != batch_len:
             raise ValueError(
                 f"expected len(prompt)==len(image)==len(condition_images)==batch_size, got "
@@ -497,6 +505,9 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
     """
     Same judge prompt as :class:`ToolGenSearchBetterJudgeRewardModel`, but calls Alibaba Frontier
     ``llm-chat-api`` through ToolGen's ``FrontierModel`` (synchronous ``requests`` backend).
+
+    Uses the same ``prompt`` (refined / generator) vs ``user_prompt`` (original / judge task text)
+    contract as the HTTP variant.
 
     Requires a checkout of ToolGen on disk. Set ``extra_kwargs``:
 
@@ -995,12 +1006,12 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
             image = [frames[0] for frames in video]
         if image is None:
             raise ValueError("Either 'image' or 'video' must be provided for ToolGenSearchBetterJudgeFrontier")
+        batch_len = len(prompt)
         if condition_images is None:
-            raise ValueError("condition_images is required")
+            condition_images = [None] * batch_len
         if user_prompt is None:
             raise ValueError("user_prompt is required")
 
-        batch_len = len(prompt)
         if len(image) != batch_len or len(condition_images) != batch_len:
             raise ValueError(
                 f"expected len(prompt)==len(image)==len(condition_images)==batch_size, got "

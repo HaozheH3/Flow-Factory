@@ -381,6 +381,177 @@ class BaseTrainer(ABC):
         """Evaluation for one epoch."""
         pass
 
+    def _gather_reward_arrays_from_local_samples(
+        self, local_samples: List[BaseSample]
+    ) -> Dict[str, np.ndarray]:
+        """Stack per-sample rewards (and advantage when present), ``accelerator.gather`` like eval."""
+
+        def _scalar_reward_component(x: Any, *, component: str, sample_index: int) -> torch.Tensor:
+            device = self.accelerator.device
+            if isinstance(x, torch.Tensor):
+                t = x.detach().to(device).reshape(-1)
+            else:
+                t = torch.as_tensor(x, device=device).reshape(-1)
+            if t.numel() != 1:
+                raise ValueError(
+                    f"train rollout dump: expected scalar-like {component} for sample "
+                    f"{sample_index}, got shape {tuple(t.shape)}"
+                )
+            return t[0]
+
+        if not local_samples:
+            self.accelerator.wait_for_everyone()
+            return {}
+
+        first_extras = local_samples[0].extra_kwargs
+        reward_keys = sorted((first_extras.get("rewards") or {}).keys())
+        include_advantage = "advantage" in first_extras
+
+        tensors: Dict[str, torch.Tensor] = {}
+        for k in reward_keys:
+            vals: List[torch.Tensor] = []
+            for i, s in enumerate(local_samples):
+                rmap = s.extra_kwargs.get("rewards")
+                if rmap is None or k not in rmap:
+                    raise ValueError(
+                        "train rollout dump: sample "
+                        f"{i} missing extra_kwargs['rewards'][{k!r}] after prepare_feedback."
+                    )
+                vals.append(_scalar_reward_component(rmap[k], component=f"rewards[{k!r}]", sample_index=i))
+            tensors[k] = torch.stack(vals)
+
+        if include_advantage:
+            adv_vals: List[torch.Tensor] = []
+            for i, s in enumerate(local_samples):
+                if "advantage" not in s.extra_kwargs:
+                    raise ValueError(
+                        f"train rollout dump: sample {i} missing extra_kwargs['advantage'] "
+                        "after prepare_feedback."
+                    )
+                adv_vals.append(
+                    _scalar_reward_component(
+                        s.extra_kwargs["advantage"],
+                        component="advantage",
+                        sample_index=i,
+                    )
+                )
+            tensors["advantage"] = torch.stack(adv_vals)
+
+        gathered: Dict[str, np.ndarray] = {}
+        for key, value in tensors.items():
+            gathered_tensor: torch.Tensor = self.accelerator.gather(value)  # type: ignore[assignment]
+            gathered[key] = gathered_tensor.cpu().numpy()
+        self.accelerator.wait_for_everyone()
+        return gathered
+
+    def _gather_rollout_artifacts_and_maybe_dump(
+        self,
+        local_samples: List[BaseSample],
+        gathered_rewards: Dict[str, np.ndarray],
+        *,
+        subdir: str,
+        leaf_dir_name: str,
+        log_kind: str,
+        summary_status: str,
+        error_traceback: Optional[str] = None,
+    ) -> None:
+        """Gather samples with ``gather_object``; main process writes eval_dump-compatible artifacts."""
+        from accelerate.utils.operations import gather_object
+
+        from ..utils.eval_dump import dump_eval_artifacts
+
+        # accelerate ``gather_object`` on a list returns one flat list across ranks (concat per rank).
+        # Do not iterate samples again: ``BaseSample.__iter__`` yields field names, not samples.
+        gathered_samples = gather_object(local_samples)
+        if self.accelerator.is_main_process:
+            flat: List[BaseSample] = []
+            for i, item in enumerate(gathered_samples):
+                if not isinstance(item, BaseSample):
+                    raise TypeError(
+                        "rollout gather_object expected only BaseSample instances after concat "
+                        f"across ranks; index {i} has type {type(item).__name__}: {item!r}"
+                    )
+                flat.append(item)
+            run_name = str(self.log_args.run_name)
+            root = os.path.join(str(self.log_args.save_dir), run_name, subdir)
+            out_dir = os.path.join(root, leaf_dir_name)
+            logger.info(
+                "%s: writing summary/images under %s "
+                "(separate from reward frontier_judge_dump_dir ToolGen/Frontier logs)",
+                log_kind,
+                out_dir,
+            )
+            dump_eval_artifacts(
+                output_dir=out_dir,
+                epoch=self.epoch,
+                step=self.step,
+                samples=flat,
+                gathered_rewards=gathered_rewards,
+                status=summary_status,
+                error_traceback=error_traceback,
+            )
+        self.accelerator.wait_for_everyone()
+
+    def _gather_eval_samples_and_maybe_dump(
+        self,
+        local_samples: List[BaseSample],
+        gathered_rewards: Dict[str, np.ndarray],
+        *,
+        status: str,
+        error_traceback: Optional[str] = None,
+    ) -> None:
+        """Gather eval samples across ranks; main process may write artifacts under the run folder."""
+        if not self.eval_args.eval_dump_enable:
+            return
+
+        save_dir = self.log_args.save_dir
+        if not save_dir:
+            if self.accelerator.is_main_process:
+                logger.warning(
+                    "eval_dump_enable is True but log.save_dir is empty; skipping eval artifact dump."
+                )
+            return
+
+        subdir = (self.eval_args.eval_dump_subdir or "eval_results").strip()
+        self._gather_rollout_artifacts_and_maybe_dump(
+            local_samples,
+            gathered_rewards,
+            subdir=subdir,
+            leaf_dir_name=f"epoch_{self.epoch:04d}_step_{self.step:06d}_{status}",
+            log_kind="Eval snapshot (eval_dump_enable)",
+            summary_status=status,
+            error_traceback=error_traceback,
+        )
+
+    def _gather_train_samples_and_maybe_dump(self, local_samples: List[BaseSample]) -> None:
+        """After prepare_feedback: optionally dump training rollouts next to eval_results-style paths."""
+        if not self.training_args.train_dump_enable:
+            return
+        freq = self.training_args.train_dump_freq
+        if freq < 1 or self.epoch % freq != 0:
+            return
+
+        save_dir = self.log_args.save_dir
+        if not save_dir:
+            if self.accelerator.is_main_process:
+                logger.warning(
+                    "train_dump_enable is True but log.save_dir is empty; skipping train rollout dump."
+                )
+            self.accelerator.wait_for_everyone()
+            return
+
+        gathered_rewards = self._gather_reward_arrays_from_local_samples(local_samples)
+        subdir = (self.training_args.train_dump_subdir or "eval_results").strip()
+        self._gather_rollout_artifacts_and_maybe_dump(
+            local_samples,
+            gathered_rewards,
+            subdir=subdir,
+            leaf_dir_name=f"train_epoch_{self.epoch:04d}_step_{self.step:06d}",
+            log_kind="Training rollout snapshot (train_dump_enable)",
+            summary_status="train",
+            error_traceback=None,
+        )
+
     def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
         """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.
 

@@ -317,6 +317,40 @@ class RewardProcessor:
         ordered.extend(sorted(combined - set(ordered)))
         return ordered
 
+    def _media_homogeneous_for_reward_batch(self, model: BaseRewardModel, samples: List[BaseSample]) -> bool:
+        """True iff no ``MEDIA_FIELDS`` column is mixed None / non-None (same rule as batch column build)."""
+        if not samples:
+            return True
+        keys = self._combined_reward_kwarg_keys(model, samples)
+        for k in keys:
+            if k not in self.MEDIA_FIELDS:
+                continue
+            column = [self._sample_field_value(s, k) for s in samples]
+            any_non_none = any(v is not None for v in column)
+            all_non_none = all(v is not None for v in column)
+            if any_non_none and not all_non_none:
+                return False
+        return True
+
+    def _split_pointwise_batch_on_media(
+        self, model: BaseRewardModel, batch_samples: List[BaseSample]
+    ) -> List[List[BaseSample]]:
+        """Split into contiguous sublists so each is media-homogeneous for ``model``."""
+        if not batch_samples:
+            return []
+        chunks: List[List[BaseSample]] = []
+        start = 0
+        n = len(batch_samples)
+        while start < n:
+            end = start + 1
+            while end <= n and self._media_homogeneous_for_reward_batch(
+                model, batch_samples[start:end]
+            ):
+                end += 1
+            chunks.append(batch_samples[start : end - 1])
+            start = end - 1
+        return chunks
+
     def _build_columns_for_reward_batch(
         self,
         *,
@@ -354,17 +388,14 @@ class RewardProcessor:
         return batch_input
 
     # ============================ Single-batch / Single-group Helpers ============================
-    def _compute_pointwise_batch(
+    def _compute_pointwise_batch_chunk(
         self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
     ) -> torch.Tensor:
-        """Compute pointwise rewards for a single batch. Returns (batch_size,) tensor."""
+        """One media-homogeneous chunk; see ``_compute_pointwise_batch``."""
         batch_input = self._build_columns_for_reward_batch(
             reward_name=name, model=model, samples=batch_samples
         )
         batch_input = self._convert_media_format(batch_input, model)
-        # Move tensor leaves onto the reward model's device (no-op when samples
-        # are already on `model.device`; required when samples are CPU-resident
-        # via the offload pipeline). Sample objects are not mutated.
         batch_input = move_tensors_to_device(batch_input, model.device)
         output = model(**batch_input)
         rewards_t = torch.as_tensor(
@@ -383,6 +414,16 @@ class RewardProcessor:
                 if vec is not None:
                     sample.extra_kwargs[TOOLGEN_JUDGE_LABELED_SCORES_KEY] = vec
         return rewards_t
+
+    def _compute_pointwise_batch(
+        self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
+    ) -> torch.Tensor:
+        """Compute pointwise rewards for a single batch. Returns (batch_size,) tensor."""
+        chunks = self._split_pointwise_batch_on_media(model, batch_samples)
+        if len(chunks) == 1:
+            return self._compute_pointwise_batch_chunk(name, model, chunks[0])
+        parts = [self._compute_pointwise_batch_chunk(name, model, ch) for ch in chunks]
+        return torch.cat(parts, dim=0)
 
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]

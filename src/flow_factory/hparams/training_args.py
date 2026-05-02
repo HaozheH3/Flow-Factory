@@ -61,6 +61,21 @@ class EvaluationArguments(ArgABC):
         default=10,
         metadata={"help": "Evaluation frequency (in epochs). 0 for no evaluation."},
     )
+    eval_dump_enable: bool = field(
+        default=False,
+        metadata={
+            "help": "Write eval artifacts (summary, JSONL, images) under "
+            "`log.save_dir` / `log.run_name` / `eval_dump_subdir`."
+        },
+    )
+    eval_dump_subdir: str = field(
+        default="eval_results",
+        metadata={
+            "help": "Directory name under each run for eval dumps; each eval writes "
+            "`epoch_{epoch}_step_{step}_{ok|error}/` inside."
+        },
+    )
+
     def __post_init__(self):
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
@@ -88,9 +103,15 @@ class EvaluationArguments(ArgABC):
                     f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
                     f"Using width to override: ({self.resolution[0]}, {self.width})."
                 )
-        
+                self.resolution = (self.resolution[0], self.width)
+
         # Final assignment
         self.height, self.width = self.resolution
+
+        if self.eval_dump_enable and not str(self.eval_dump_subdir).strip():
+            raise ValueError(
+                "eval_dump_subdir must be a non-empty string when eval_dump_enable is True"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
@@ -222,6 +243,34 @@ class TrainingArguments(ArgABC):
             ),
         },
     )
+    train_dump_enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, after prepare_feedback each epoch (when train_dump_freq matches), "
+                "gather training rollouts and write the same artifact layout as eval dumps "
+                "under log.save_dir / log.run_name / train_dump_subdir, in folders named "
+                "train_epoch_{epoch}_step_{step}."
+            ),
+        },
+    )
+    train_dump_subdir: str = field(
+        default="eval_results",
+        metadata={
+            "help": (
+                "Subdirectory under each run for training rollout dumps. Defaults to "
+                "eval_results so train and eval artifacts share one tree; train leaves use "
+                "a train_epoch_* prefix to avoid colliding with eval epoch_* folders."
+            ),
+        },
+    )
+    train_dump_freq: int = field(
+        default=1,
+        metadata={
+            "help": "Write training rollout dumps every N outer epochs (1 = every epoch). "
+            "Ignored when train_dump_enable is False."
+        },
+    )
 
     # --- EMA (accessed by models/abc.py for all algorithms) ---
     ema_decay: float = field(
@@ -309,6 +358,17 @@ class TrainingArguments(ArgABC):
                 raise ValueError(
                     f"`gradient_accumulation_steps` must be >= 1, "
                     f"got {self.gradient_accumulation_steps}."
+                )
+
+        if self.train_dump_enable:
+            if not str(self.train_dump_subdir).strip():
+                raise ValueError(
+                    "train_dump_enable is True but train_dump_subdir is empty or whitespace-only."
+                )
+            if self.train_dump_freq < 1:
+                raise ValueError(
+                    f"train_dump_freq must be >= 1 when train_dump_enable is True, "
+                    f"got {self.train_dump_freq}."
                 )
 
         # --- Optimizer defaults ---

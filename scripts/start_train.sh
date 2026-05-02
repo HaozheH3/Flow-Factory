@@ -54,7 +54,10 @@ CONFIG="${CONFIG:-/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/nft/lo
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo_warmstart_lora.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/lora/flux2_klein_judge_frontier.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/full/flux2_klein_toolgen_judge_dpo.yaml
-CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/full/flux2_klein_toolgen_judge_dpo_9b.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/lora/flux2_klein_toolgen_judge_grpo.yaml
+CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/full/flux2_klein_judge_frontier.yaml
 # Ephemeral / bulky caches: keep under repo .runtime_cache; Hugging Face hub reads use LOCAL_MODELS_ROOT
 FLOW_CACHE_ROOT="${FLOW_CACHE_ROOT:-${REPO_ROOT}/.runtime_cache}"

@@ -18,13 +18,14 @@ set -xeuo pipefail
 # conda activate /primus_xpfs_workspace_T04/haozhe/flow_env
 cd /primus_xpfs_workspace_T04/haozhe/Flow-Factory
 # export KLEIN_EXTERNAL_IP=33.3.181.41
-export KLEIN_EXTERNAL_IP=33.3.187.171
+# export KLEIN_EXTERNAL_IP=33.3.187.171
+export KLEIN_EXTERNAL_IP=33.3.188.228
 # export CUDA_VISIBLE_DEVICES=4,5
 export KLEIN_GPU_IDS=4,5,6,7
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL_PATH="${MODEL_PATH:-/primus_xpfs_workspace_T04/haozhe/gen_models/black-forest-labs/flux2-klein-9b}"
+MODEL_PATH="${MODEL_PATH:-/primus_xpfs_workspace_T04/haozhe/gen_models/black-forest-labs/flux2-klein-4b-base}"
 N_GPU="${N_GPU:-2}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
 BASE_PORT="${KLEIN_FLEET_BASE_PORT:-18795}"

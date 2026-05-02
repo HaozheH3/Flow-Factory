@@ -23,7 +23,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-NODE_IP=33.3.168.168
+NODE_IP=33.3.188.228
 BAGEL_GPU_IDS=0,1,2,3
 BAGEL_REPO=/primus_xpfs_workspace_T04/haozhe/BAGEL
 BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-/primus_xpfs_workspace_T04/haozhe/gen_models/bagel-7b-mot}"
