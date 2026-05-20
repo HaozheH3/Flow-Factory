@@ -57,6 +57,8 @@ def get_data_sampler(
         raise ValueError(
             f"Unknown sampler_type={sampler_type!r}. Expected one of {sorted(SAMPLER_REGISTRY)}."
         )
+    _ds_seed = getattr(training_args, 'data_shuffle_seed', None)
+    shuffle_seed = _ds_seed if _ds_seed is not None else training_args.seed
     return sampler_cls(
         dataset=dataset,
         batch_size=training_args.per_device_batch_size,
@@ -64,5 +66,5 @@ def get_data_sampler(
         unique_sample_num=training_args.unique_sample_num_per_epoch,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
-        seed=training_args.seed,
+        seed=shuffle_seed,
     )

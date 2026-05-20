@@ -206,6 +206,14 @@ class TrainingArguments(ArgABC):
         default=42,
         metadata={"help": "Random seed."},
     )
+    data_shuffle_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": (
+            "Seed for data sampler shuffling. If None, a random seed is generated "
+            "at startup so each run sees a different data order. Set to a fixed int "
+            "for reproducible data ordering across runs."
+        )},
+    )
 
     # --- Optimization ---
     learning_rate: float = field(
@@ -301,6 +309,12 @@ class TrainingArguments(ArgABC):
     )
 
     def __post_init__(self):
+        # --- Data shuffle seed ---
+        if self.data_shuffle_seed is None:
+            import random
+            self.data_shuffle_seed = random.randint(0, 2**31 - 1)
+        logger.info(f"Data shuffle seed (data_shuffle_seed): {self.data_shuffle_seed}")
+
         # --- Resolution standardization ---
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
