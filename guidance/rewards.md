@@ -79,10 +79,10 @@ Flow-Factory supports two paradigms for computing rewards:
 
 | Config | Reward | Task |
 |--------|--------|------|
-| ``examples/nft/lora/qwen_image/rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | Qwen-Image T2I |
-| ``examples/nft/lora/flux1/rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | FLUX.1-dev T2I |
-| ``examples/nft/lora/qwen_image_edit_plus/rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | Qwen-Image-Edit-Plus |
-| ``examples/nft/lora/flux1_kontext/rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | FLUX.1-Kontext |
+| ``examples/nft/lora/qwen_image_rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | Qwen-Image T2I |
+| ``examples/nft/lora/flux1_rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | FLUX.1-dev T2I |
+| ``examples/nft/lora/qwen_image_edit_plus_rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | Qwen-Image-Edit-Plus |
+| ``examples/nft/lora/flux1_kontext_rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | FLUX.1-Kontext |
 
 Rubric format and project background: [TIGER-AI-Lab/RationalRewards](https://github.com/TIGER-AI-Lab/RationalRewards). Tuning how parsed aspect scores map to the final scalar: adjust ``aggregate_aspect_scores`` in ``src/flow_factory/rewards/rational_rewards_t2i.py`` (shared with edit via ``supported_aspects``) or post-process in the edit module after parsing.
 
@@ -109,42 +109,6 @@ rewards:
   reward_model: "PickScore"
   batch_size: 16
 ```
-
-
-### Rational Rewards and vLLM judge
-
-``rational_rewards_t2i`` and ``rational_rewards_edit`` call a **remote** vision-language model through an **OpenAI-compatible** HTTP API. The usual deployment is [vLLM](https://github.com/vllm-project/vllm) ``vllm serve``.
-
-1. **Install** the judge stack in an environment that has vLLM (see vLLM docs for CUDA / driver requirements). Training only needs ``pip install openai`` in the Flow-Factory environment.
-2. **Start the server** (example wrapper; reward model weights are [TIGER-Lab/RationalRewards-8B-T2I](https://huggingface.co/TIGER-Lab/RationalRewards-8B-T2I) for T2I and [TIGER-Lab/RationalRewards-8B-Edit](https://huggingface.co/TIGER-Lab/RationalRewards-8B-Edit) for image edit):
-
-   ```bash
-   # T2I rubric judge (default MODEL_PATH in the script is this repo id)
-   export CUDA_VISIBLE_DEVICES=0,1
-   export MODEL_PATH="TIGER-Lab/RationalRewards-8B-T2I"
-   ./scripts/start_vllm_rational_reward.sh --max-model-len 8192
-   # With two GPUs in CUDA_VISIBLE_DEVICES, the script sets --data-parallel-size to 2 unless you override DATA_PARALLEL_SIZE.
-
-   # Image-edit rubric judge (separate process or machine)
-   # export CUDA_VISIBLE_DEVICES=2,3
-   # export MODEL_PATH="TIGER-Lab/RationalRewards-8B-Edit"
-   # ./scripts/start_vllm_rational_reward.sh --max-model-len 8192
-   ```
-
-   Override ``PORT``, ``SERVED_MODEL_NAME``, ``TENSOR_PARALLEL_SIZE``, ``DATA_PARALLEL_SIZE``, or ``VLLM_BIN`` via environment variables documented in ``scripts/start_vllm_rational_reward.sh``.
-
-3. **Point training YAML** at the API: set ``api_base_url`` to ``http://<host>:<port>/v1`` (trailing ``/v1`` is required for ``AsyncOpenAI``) and set ``vlm_model`` to the same string as vLLM’s ``--served-model-name``. The start script defaults that to ``RationalRewards-8B-T2I`` when ``MODEL_PATH`` is the T2I checkpoint, and ``RationalRewards-8B-Edit`` when ``MODEL_PATH`` is the edit checkpoint (override with ``SERVED_MODEL_NAME`` if you choose a different id).
-
-**Example NFT LoRA configs** (placeholders ``127.0.0.1:8000`` — change to your judge host):
-
-| Config | Reward | Task |
-|--------|--------|------|
-| ``examples/nft/lora/qwen_image_rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | Qwen-Image T2I |
-| ``examples/nft/lora/flux1_rational_rewards_t2i.yaml`` | ``rational_rewards_t2i`` | FLUX.1-dev T2I |
-| ``examples/nft/lora/qwen_image_edit_plus_rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | Qwen-Image-Edit-Plus |
-| ``examples/nft/lora/flux1_kontext_rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | FLUX.1-Kontext |
-
-Details and rubric alignment: [Rational Rewards T2I](rational_rewards_t2i_reward.md), [Rational Rewards Edit](rational_rewards_edit_reward.md).
 
 ## Creating Custom Reward Models
 
@@ -431,7 +395,7 @@ rewards:
     # async_reward defaults to false
 ```
 
-> See [`examples/grpo/lora/sd3_5/nocfg.yaml`](../examples/grpo/lora/sd3_5/nocfg.yaml) for a complete training config.
+> See [`examples/grpo/lora/sd3_5_nocfg.yaml`](../examples/grpo/lora/sd3_5_nocfg.yaml) for a complete training config.
 
 ### Per-Model Parameters
 
