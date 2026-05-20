@@ -44,6 +44,7 @@ from ..utils.audio import standardize_audio_batch
 from .toolgen_searchbetter_judge_common import (
     TOOLGEN_JUDGE_LABELED_SCORES_KEY,
     TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE,
+    TOOLGEN_JUDGE_TRANSCRIPT_KEY,
     toolgen_mean_reward_drop_constant_dimensions,
 )
 
@@ -413,6 +414,16 @@ class RewardProcessor:
             for sample, vec in zip(batch_samples, labeled_batch):
                 if vec is not None:
                     sample.extra_kwargs[TOOLGEN_JUDGE_LABELED_SCORES_KEY] = vec
+        transcript_batch = extra.get("judge_transcript_batch")
+        if transcript_batch is not None:
+            if len(transcript_batch) != len(batch_samples):
+                raise ValueError(
+                    f"reward {name!r}: judge_transcript_batch length {len(transcript_batch)} "
+                    f"!= batch size {len(batch_samples)}"
+                )
+            for sample, tr in zip(batch_samples, transcript_batch):
+                if tr is not None:
+                    sample.extra_kwargs[TOOLGEN_JUDGE_TRANSCRIPT_KEY] = tr
         return rewards_t
 
     def _compute_pointwise_batch(

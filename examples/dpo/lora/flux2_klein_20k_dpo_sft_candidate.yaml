@@ -1,0 +1,156 @@
+# DPO + Candidate SFT on FLUX.2 Klein (i2i).
+#
+# sft_candidate_mode: candidates are excluded from DPO pair formation and
+# trained with a flow-matching velocity MSE loss (weight = sft_candidate_weight).
+# DPO operates purely on-policy K rollouts; candidates only contribute SFT gradient.
+#
+# Metrics: train/sft_diffusion_loss (unweighted MSE), train/dpo_loss,
+#          train/dpo_pref_candidate_is_chosen_rate (should be 0.0 in this mode).
+#
+# Based on examples/dpo/lora/flux2_klein_20k_dpo_preference_sim.yaml
+
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/dataset/klein_i2i_dpo_20k_toolgen_v1"
+  enable_preprocess: false
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  cache_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/cached_datasets4"
+  max_dataset_size: 16384
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "/primus_xpfs_workspace_T04/haozhe/gen_models/black-forest-labs/flux2-klein-4b-base"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "swanlab"
+  save_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/modeloutputs"
+  save_freq: 10
+  save_model_only: true
+
+train:
+  trainer_type: "dpo"
+  dpo_log_pair_media_enable: true
+  dpo_log_pair_media_max_pairs: 16
+  dpo_log_pair_media_every_epochs: 1
+  dpo_log_preference_candidate_media_enable: true
+  dpo_log_preference_candidate_media_include_conditions: true
+  dpo_log_dataset_preference_candidate_path_index: 0
+  beta: 100.0
+  ref_param_device: "cpu"
+
+  global_std: false
+  advantage_aggregation: "gdpo"
+
+  # Candidate injection — images loaded from metadata
+  preference_extra_candidates: 1
+  preference_candidate_metadata_key: "dpo_preference_candidate_images"
+
+  # SFT candidate mode — candidates excluded from DPO pairs, trained with velocity MSE
+  sft_candidate_mode: true
+  sft_candidate_weight: 0.3
+
+  # I2I condition SSIM
+  dpo_condition_ssim_enable: true
+  dpo_penalize_condition_ssim: 0.95
+  dpo_selection_rule_penalty: 0.1
+  dpo_high_ssim_log_threshold: 0.9
+
+  weighting_scheme: "logit_normal"
+  logit_mean: 0.0
+  logit_std: 1.0
+
+  num_train_timesteps: 0
+  time_shift: 1.0
+  timestep_range: 0.1
+
+  resolution: 512
+  condition_image_size: 512
+
+  num_inference_steps: 50
+  guidance_scale: 4.0
+
+  per_device_batch_size: 1
+  group_size: 6
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: auto
+  num_inner_epochs: 1
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.99
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: true
+  train_dump_enable: true
+  train_dump_subdir: "eval_results"
+  seed: 42
+
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 1.0
+  num_sde_steps: 1
+  sde_steps: [0, 1, 2, 3]
+  seed: 42
+
+eval:
+  resolution: 512
+  condition_image_size: 512
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 50
+  eval_freq: 10
+  eval_dump_enable: true
+  eval_dump_subdir: "eval_results"
+  seed: 42
+
+rewards:
+  - name: "judge"
+    reward_model: "toolgen_searchbetter_judge_frontier"
+    toolgen_retain_labeled_scores_in_samples: true
+    batch_size: 16
+    device: "cpu"
+    dtype: bfloat16
+    toolgen_phase4_agent_dir: "/primus_xpfs_workspace_T04/haozhe/ToolGen/phase4_agent"
+    frontier_model_name: "doubao-seed-2.0-mini"
+    max_concurrent: 16
+    max_retries: 3
+    temperature: 0.2
+    max_tokens: 8000
+    max_pixels: 589824
+    frontier_max_total_pixels: 589824
+    variant: "training"
+    frontier_api_timeout: 300
+    frontier_judge_error_policy: penalize
+    frontier_judge_penalty_value: 0.0
+    toolgen_judge_major_aspect_weights:
+      rubric_adaptive: 1.5
+      checklist: 1.5
+      prompt_faithfulness: 1.5
+      image_quality: 1.0
+      text_rendering: 1.5
+      ai_naturalness: 1.0
+      composition_and_aesthetics: 1.0
+      visual_reference_evaluation: 1.5
+      text_reference_evaluation: 1.0

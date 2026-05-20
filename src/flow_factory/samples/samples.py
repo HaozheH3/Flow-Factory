@@ -51,8 +51,12 @@ from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
+# Set to True on ``BaseSample.extra_kwargs`` for DPO preference-image clones (see DPOTrainer._form_pairs).
+DPO_PREFERENCE_CANDIDATE_FLAG = "dpo_is_preference_candidate"
+
 
 __all__ = [
+    "DPO_PREFERENCE_CANDIDATE_FLAG",
     'BaseSample',
     'ImageConditionSample',
     'VideoConditionSample',

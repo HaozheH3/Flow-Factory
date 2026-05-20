@@ -29,7 +29,12 @@ from .abc import ArgABC
 from .data_args import DataArguments
 from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
-from .training_args import TrainingArguments, EvaluationArguments, get_training_args_class
+from .training_args import (
+    DPOTrainingArguments,
+    EvaluationArguments,
+    TrainingArguments,
+    get_training_args_class,
+)
 from .reward_args import RewardArguments, MultiRewardArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
@@ -107,6 +112,18 @@ class Arguments(ArgABC):
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+        self._sync_dpo_preference_group_size()
+
+    def _sync_dpo_preference_group_size(self) -> None:
+        """Refresh DPO rollouts + fixed-candidate count after batch/sampler alignment.
+
+        ``_align_batch_geometry`` may change ``group_size`` (e.g. group_distributed
+        sampler). ``preference_group_size`` must stay ``group_size +
+        preference_extra_candidates`` so reward buffers match injected batches.
+        """
+        ta = self.training_args
+        if isinstance(ta, DPOTrainingArguments):
+            ta.preference_group_size = int(ta.group_size) + int(ta.preference_extra_candidates)
 
     def _resolve_sampler_type(self) -> None:
         """Choose the distributed sampler strategy.

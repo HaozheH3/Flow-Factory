@@ -86,6 +86,35 @@ LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 
 logger = setup_logger(__name__)
 
+_peft_tp_shard_patch_installed = False
+
+
+def _install_peft_distributed_lora_tp_compat_patch() -> None:
+    """Avoid PEFT LoRA load failures when torch.distributed is initialized but Transformers has no TP helpers.
+
+    Recent PEFT versions call ``_maybe_shard_state_dict_for_tp`` for LoRA checkpoints whenever distributed is
+    initialized. That path imports ``transformers.integrations.tensor_parallel``, which is absent on some
+    Transformers installs even though Flow-Factory runs standard data-parallel training (no HF tensor
+    parallelism). In that case skipping TP resharding is correct.
+    """
+    global _peft_tp_shard_patch_installed
+    if _peft_tp_shard_patch_installed:
+        return
+    import peft.utils.save_and_load as peft_sal
+
+    _original_maybe_shard = peft_sal._maybe_shard_state_dict_for_tp
+
+    def _maybe_shard_state_dict_for_tp_compat(model, state_dict, adapter_name):
+        try:
+            import transformers.integrations.tensor_parallel  # noqa: F401
+        except ModuleNotFoundError:
+            return
+        return _original_maybe_shard(model, state_dict, adapter_name)
+
+    peft_sal._maybe_shard_state_dict_for_tp = _maybe_shard_state_dict_for_tp_compat
+    _peft_tp_shard_patch_installed = True
+
+
 @dataclass
 class NamedParametersInfo:
     """Metadata for named parameters snapshot."""
@@ -515,6 +544,36 @@ class BaseAdapter(ABC):
                 optimization_step=step
             )
 
+    def dpo_clone_sample_with_preference_image(
+        self,
+        template: BaseSample,
+        pil_image: Image.Image,
+        metadata_key_to_drop: str,
+    ) -> BaseSample:
+        """Build one extra group member for DPO (same conditioning, new pixels / latents).
+
+        Used when ``DPOTrainingArguments.preference_extra_candidates > 0``. Model adapters that
+        support this hook must encode the image into the same packed-latent space as inference
+        outputs (final trajectory step).
+
+        Args:
+            template: Any rollout sample from the same ``unique_id`` group.
+            pil_image: RGB candidate loaded from disk (same task as template, not an extra condition).
+              Geometry is aligned to the rollout's ``template.height``/``width`` inside the adapter
+              (e.g. letterbox on white) so it matches online sampling resolution.
+            metadata_key_to_drop: Training metadata key listing candidate paths (stripped from clone).
+
+        Returns:
+            Cloned sample whose ``extra_kwargs`` include ``DPO_PREFERENCE_CANDIDATE_FLAG`` set to ``True``
+            (see ``flow_factory.samples.DPO_PREFERENCE_CANDIDATE_FLAG``; used by DPOTrainer pairing metrics).
+
+        Raises:
+            NotImplementedError: If this adapter does not implement preference candidates.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement dpo_clone_sample_with_preference_image; "
+            "set train.preference_extra_candidates=0 or add an adapter implementation."
+        )
 
     @contextmanager
     def use_ema_parameters(self):
@@ -1471,6 +1530,7 @@ class BaseAdapter(ABC):
 
     def _load_lora(self, path: str) -> None:
         """Load LoRA adapters for target components with auto-format detection."""
+        _install_peft_distributed_lora_tp_compat_patch()
         for comp_name in self.model_args.target_components:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")

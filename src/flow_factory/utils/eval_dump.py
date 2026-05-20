@@ -5,9 +5,14 @@
 
 """Write evaluation artifacts under ``{save_dir}/{run_name}/{eval_dump_subdir}/...``.
 
-Each eval leaf directory includes ``summary.json``, ``samples.jsonl``, ``images/``, and optionally
-``judge_transcripts/`` (one JSON per sample) when Frontier/ToolGen judges set
-``toolgen_attach_judge_transcript`` so ``extra_kwargs['_toolgen_judge_transcript']`` is populated.
+Each eval leaf directory includes ``summary.json``, ``samples.jsonl``, ``images/``, and
+``judge_transcripts/`` (one JSON per sample) when judge models populate
+``extra_kwargs['_toolgen_judge_transcript']`` (ToolGen / Frontier / vLLM judges do this on every call).
+
+HTTP Klein/Bagel workers respond with SSE ``data: {"code","message","data":{"choices":[...]}}``.
+To preserve that nested shape in JSONL (not only the flattened image path), set
+``sample.extra_kwargs["generation_api_sse_response"]`` to the parsed payload dict from the HTTP client
+(see sibling ``Flow-Factory-bagel-merge`` rollout / generation helpers when using remote workers).
 
 Condition/reference images use ``sample_XXXXX_condition_YY.png`` next to ``sample_XXXXX_generated.png``.
 Identical refs across a group dedupe via hard link (or same-dir symlink when hard link fails). JSONL rows
@@ -30,6 +35,10 @@ from ..utils.image import standardize_image_batch
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
+
+# Parsed JSON object from the first ``data:`` SSE line of a Klein/Bagel/ToolGen-compatible
+# generation POST response (same structure servers build in ``_sse_body``).
+GENERATION_API_SSE_RESPONSE_KEY = "generation_api_sse_response"
 
 # Mirrors ``TOOLGEN_JUDGE_TRANSCRIPT_KEY`` in ``rewards/toolgen_searchbetter_judge_common``;
 # inlined so ``utils.eval_dump`` does not import ``flow_factory.rewards`` (avoids fragile import graphs).
@@ -74,9 +83,19 @@ def _write_or_link_condition_png(
         digest_to_canonical_abs[digest] = os.path.abspath(duplicate_abs)
         return rel
 
-    if os.path.exists(duplicate_abs):
-        raise FileExistsError(f"refusing to overwrite existing condition path {duplicate_abs!r}")
     source = os.path.abspath(canonical_abs)
+    if os.path.exists(duplicate_abs):
+        try:
+            with open(duplicate_abs, "rb") as fh:
+                existing_digest = hashlib.sha256(fh.read()).hexdigest()
+        except OSError as exc:
+            raise OSError(
+                f"could not read existing condition image at {duplicate_abs!r} "
+                f"(sample_index={sample_index} slot={slot_index})"
+            ) from exc
+        if existing_digest == digest:
+            return rel
+        os.remove(duplicate_abs)
     try:
         os.link(source, duplicate_abs)
     except OSError as exc_hard:
@@ -181,6 +200,12 @@ def dump_eval_artifacts(
                             row[f"{ek}_truncated"] = True
                     else:
                         row[ek] = val
+
+            sse_payload = sample.extra_kwargs.get(GENERATION_API_SSE_RESPONSE_KEY)
+            if sse_payload is None:
+                sse_payload = sample.extra_kwargs.get("model_raw_sse_response")
+            if sse_payload is not None:
+                row[GENERATION_API_SSE_RESPONSE_KEY] = sse_payload
 
             transcript = sample.extra_kwargs.get(_EXTRA_KW_TOOLGEN_JUDGE_TRANSCRIPT)
             if transcript is not None:

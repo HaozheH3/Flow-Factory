@@ -40,10 +40,11 @@ logger = setup_logger(__name__, rank_zero_only=True)
 def _load_jsonl_homogeneous(jsonl_path: str) -> HFDataset:
     """Load JSONL without HuggingFace auto-inferred struct columns.
 
-    Rows from ToolGen shards store ``evaluation_rubric`` as a JSON object whose
-    keys differ per task. HF ``load_dataset('json')`` merges that into a single
-    Arrow struct schema and fails with ``TypeError: Couldn't cast array`` when
-    keys disagree across rows. We therefore store that field as a JSON string
+    Rows from ToolGen shards store ``evaluation_rubric`` and
+    ``difficulty_with_ideal_visual_references`` as JSON objects whose keys/types
+    differ per task. HF ``load_dataset('json')`` merges those into a single Arrow
+    struct schema and fails with ``ArrowInvalid: cannot mix struct and non-struct``
+    when types disagree across rows. We normalize dict fields to JSON strings
     in-memory (existing files may still have nested dicts on disk; both work
     after normalization here).
     """
@@ -72,6 +73,9 @@ def _load_jsonl_homogeneous(jsonl_path: str) -> HFDataset:
                     f"{jsonl_path!r} line {line_num}: evaluation_rubric must be dict, str, or null, "
                     f"got {type(er).__name__}: {er!r}"
                 )
+            dv = row.get("difficulty_with_ideal_visual_references")
+            if isinstance(dv, dict):
+                row["difficulty_with_ideal_visual_references"] = json.dumps(dv, ensure_ascii=False)
             records.append(row)
     if not records:
         return HFDataset.from_list([])

@@ -29,11 +29,16 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
 from ..hparams import GRPOTrainingArguments
-from ..samples import BaseSample
-from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt
+from ..samples import BaseSample, DPO_PREFERENCE_CANDIDATE_FLAG
+from ..models.abc import BaseAdapter
+from ..rewards import RewardBuffer
+from ..advantage import AdvantageProcessor
+from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt, to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
+from ..utils.noise_schedule import TimeSampler, flow_match_sigma
 from ..utils.dist import reduce_loss_info
+from diffusers.utils.torch_utils import randn_tensor
 
 logger = setup_logger(__name__)
 
@@ -52,11 +57,47 @@ class GRPOTrainer(BaseTrainer):
         super().__init__(**kwargs)
         self.training_args : GRPOTrainingArguments
         self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
+        if self.training_args.preference_extra_candidates > 0:
+            if (
+                type(self.adapter).dpo_clone_sample_with_preference_image
+                is BaseAdapter.dpo_clone_sample_with_preference_image
+            ):
+                raise TypeError(
+                    "train.preference_extra_candidates > 0 requires an adapter that overrides "
+                    "dpo_clone_sample_with_preference_image (e.g. Flux2KleinAdapter)."
+                )
+
+    def _init_reward_model(self):
+        """Use enlarged group size for training reward buffer when injecting preference candidates."""
+        super()._init_reward_model()
+        if self.training_args.preference_extra_candidates > 0:
+            pgs = int(self.training_args.group_size) + int(self.training_args.preference_extra_candidates)
+            self.reward_buffer = RewardBuffer(self.reward_processor, pgs)
+            train_reward_configs = self.reward_loader.get_reward_configs('train')
+            self.advantage_processor = AdvantageProcessor(
+                accelerator=self.accelerator,
+                reward_weights={
+                    name: cfg.weight
+                    for name, cfg in train_reward_configs.items()
+                },
+                group_size=pgs,
+                global_std=getattr(self.training_args, 'global_std', True),
+                sampler_type=self.config.data_args.sampler_type,
+                verbose=self.log_args.verbose,
+                max_train_samples_for_log=self.log_args.log_max_train_samples,
+            )
 
     @property
     def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
+
+    @property
+    def enable_sft_candidate(self) -> bool:
+        return (
+            self.training_args.sft_candidate_mode
+            and self.training_args.preference_extra_candidates > 0
+        )
 
     def start(self):
         """Main training loop."""
@@ -139,6 +180,8 @@ class GRPOTrainer(BaseTrainer):
                     for key, value in rewards.items()
                 }
                 
+                flat_start_eval = self._gather_object_flat_start_index(len(all_samples))
+
                 # Log statistics
                 if self.accelerator.is_main_process:
                     _log_data = {
@@ -151,7 +194,13 @@ class GRPOTrainer(BaseTrainer):
                             for key, value in gathered_rewards.items()
                         }
                     )
-                    _log_data['eval_samples'] = all_samples
+                    logged_eval = self._eval_samples_for_logger(all_samples)
+                    self._stamp_eval_logged_samples_predicted_dump_png_paths_if_enabled(
+                        logged_eval,
+                        flat_start_index=flat_start_eval,
+                        eval_status=eval_status,
+                    )
+                    _log_data['eval_samples'] = logged_eval
                     self.log_data(_log_data, step=self.step)
                 self.accelerator.wait_for_everyone()
         except Exception:
@@ -178,6 +227,24 @@ class GRPOTrainer(BaseTrainer):
             num_inference_steps=self.training_args.num_inference_steps,
         )
 
+        pref_extra = self.training_args.preference_extra_candidates
+        k = self.training_args.group_size
+        if pref_extra > 0:
+            sampler_name = self.config.data_args.sampler_type
+            if sampler_name != "group_contiguous":
+                raise RuntimeError(
+                    "train.preference_extra_candidates > 0 requires data.sampler_type='group_contiguous' "
+                    f"Got sampler_type={sampler_name!r}."
+                )
+
+        rollout_pending: List[BaseSample] = []
+
+        def _finalize_group(chunk: List[BaseSample]) -> List[BaseSample]:
+            self._maybe_offload_samples_to_cpu(chunk)
+            if pref_extra <= 0:
+                return list(chunk)
+            return self._inject_preference_candidates(list(chunk))
+
         with torch.no_grad(), self.autocast():
             for batch_index in tqdm(
                 range(self.training_args.num_batches_per_epoch),
@@ -188,17 +255,30 @@ class GRPOTrainer(BaseTrainer):
                 sample_kwargs = {
                     **self.training_args,
                     'compute_log_prob': True,
-                    'trajectory_indices': trajectory_indices, # Selectively store required trajectory positions for memory efficiency
+                    'trajectory_indices': trajectory_indices,
                     **batch,
                 }
                 sample_kwargs = self._materialize_jsonl_images_for_adapter_inference(sample_kwargs)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
-                # Deterministic D2H so reward_buffer sees CPU-resident samples
-                # (no-op when offload_samples_to_cpu is False).
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
+
+                if pref_extra > 0:
+                    for s in sample_batch:
+                        rollout_pending.append(s)
+                        if len(rollout_pending) == k:
+                            group_with_candidates = _finalize_group(rollout_pending)
+                            samples.extend(group_with_candidates)
+                            self.reward_buffer.add_samples(group_with_candidates)
+                            rollout_pending = []
+                else:
+                    self._maybe_offload_samples_to_cpu(sample_batch)
+                    samples.extend(sample_batch)
+                    self.reward_buffer.add_samples(sample_batch)
+
+        if rollout_pending:
+            self._maybe_offload_samples_to_cpu(rollout_pending)
+            samples.extend(rollout_pending)
+            self.reward_buffer.add_samples(rollout_pending)
 
         return samples
 
@@ -207,8 +287,16 @@ class GRPOTrainer(BaseTrainer):
         """Finalize rewards from the buffer, compute advantages, and log advantage metrics."""
         rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
         self.compute_advantages(samples, rewards, store_to_samples=True)
+        # Candidates get advantage=0 so they don't contribute to RL loss if they slip through
+        if self.enable_sft_candidate:
+            for s in samples:
+                if self._is_preference_candidate_sample(s):
+                    s.advantage = torch.tensor(0.0)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
         if adv_metrics:
+            self._maybe_stamp_train_samples_predicted_dump_png_paths(
+                adv_metrics, num_local_rollout_samples=len(samples),
+            )
             self.log_data(adv_metrics, step=self.step)
 
     # =========================== Optimization Loop ============================
@@ -216,12 +304,29 @@ class GRPOTrainer(BaseTrainer):
         """Policy optimization (Stage 6): PPO-style clipped loss and optional KL."""
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+
+        # Separate SFT candidate samples from RL samples
+        sft_candidate_samples: List[BaseSample] = []
+        rl_samples: List[BaseSample] = samples
+        if self.enable_sft_candidate:
+            rl_samples = [s for s in samples if not self._is_preference_candidate_sample(s)]
+            sft_candidate_samples = [s for s in samples if self._is_preference_candidate_sample(s)]
+
+        num_batches = (len(rl_samples) + per_device_batch_size - 1) // per_device_batch_size
+
+        # Pre-batch SFT candidates (cycle through them during RL training)
+        sft_batches: List[List[BaseSample]] = []
+        if sft_candidate_samples:
+            sft_batches = [
+                sft_candidate_samples[i:i + per_device_batch_size]
+                for i in range(0, len(sft_candidate_samples), per_device_batch_size)
+            ]
+
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle samples at the beginning of each inner epoch
             perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            perm = torch.randperm(len(rl_samples), generator=perm_gen)
+            shuffled_samples = [rl_samples[i] for i in perm]
 
             self.adapter.train()
             loss_info = defaultdict(list)
@@ -288,7 +393,7 @@ class GRPOTrainer(BaseTrainer):
                                     return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'dt']
                             else:
                                 return_kwargs = ['log_prob', 'dt']
-                            
+
                             forward_inputs['return_kwargs'] = return_kwargs
                             output = self.adapter.forward(**forward_inputs)
 
@@ -306,6 +411,50 @@ class GRPOTrainer(BaseTrainer):
                             policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                             loss = policy_loss
+
+                            # 3.5 SFT candidate loss (flow-matching velocity MSE)
+                            if sft_batches:
+                                sft_batch_idx = batch_idx % len(sft_batches)
+                                sft_batch_samples = [s.to(device) for s in sft_batches[sft_batch_idx]]
+                                sft_batch_stacked = BaseSample.stack(sft_batch_samples)
+                                sft_latents = sft_batch_stacked['all_latents'][:, -1]
+
+                                sft_bs = sft_latents.shape[0]
+                                sft_timesteps = TimeSampler.uniform(
+                                    batch_size=sft_bs,
+                                    num_timesteps=1,
+                                    timestep_range=(0.0, 0.99),
+                                    time_shift=1.0,
+                                    device=device,
+                                )
+                                sft_t = sft_timesteps[0]
+                                sft_sigma = flow_match_sigma(sft_t)
+                                sft_noise = randn_tensor(
+                                    sft_latents.shape,
+                                    device=sft_latents.device,
+                                    dtype=sft_latents.dtype,
+                                )
+                                sft_sigma_bc = to_broadcast_tensor(sft_sigma, sft_latents)
+                                noised_sft = (1 - sft_sigma_bc) * sft_latents + sft_sigma_bc * sft_noise
+
+                                _sft_excluded = {'all_latents', 'timesteps', 'advantage', 'log_probs'}
+                                sft_fwd_kwargs = {
+                                    **self.training_args,
+                                    'compute_log_prob': False,
+                                    'return_kwargs': ['noise_pred'],
+                                    'noise_level': 0.0,
+                                    't': sft_t,
+                                    't_next': torch.zeros_like(sft_t),
+                                    'latents': noised_sft,
+                                    **{k: v for k, v in sft_batch_stacked.items()
+                                       if k not in _sft_excluded},
+                                }
+                                sft_fwd_kwargs = filter_kwargs(self.adapter.forward, **sft_fwd_kwargs)
+                                sft_output = self.adapter.forward(**sft_fwd_kwargs)
+                                sft_target = sft_noise - sft_latents
+                                sft_loss_val = ((sft_output.noise_pred.float() - sft_target.float()) ** 2).mean()
+                                loss = loss + self.training_args.sft_candidate_weight * sft_loss_val
+                                loss_info['sft_diffusion_loss'].append(sft_loss_val.detach())
 
                             # 4. Compute KL-div
                             if self.enable_kl_loss:

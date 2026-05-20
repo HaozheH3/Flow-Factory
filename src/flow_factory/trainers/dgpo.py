@@ -853,6 +853,8 @@ class DGPOTrainer(BaseTrainer):
                     gathered: torch.Tensor = self.accelerator.gather(value)  # type: ignore[assignment]
                     gathered_rewards[key] = gathered.cpu().numpy()
 
+                flat_start_eval = self._gather_object_flat_start_index(len(all_samples))
+
                 if self.accelerator.is_main_process:
                     log_data: Dict[str, Any] = {
                         f"eval/reward_{key}_mean": np.mean(value)
@@ -864,7 +866,13 @@ class DGPOTrainer(BaseTrainer):
                             for key, value in gathered_rewards.items()
                         }
                     )
-                    log_data["eval_samples"] = all_samples
+                    logged_eval = self._eval_samples_for_logger(all_samples)
+                    self._stamp_eval_logged_samples_predicted_dump_png_paths_if_enabled(
+                        logged_eval,
+                        flat_start_index=flat_start_eval,
+                        eval_status=eval_status,
+                    )
+                    log_data["eval_samples"] = logged_eval
                     self.log_data(log_data, step=self.step)
                 self.accelerator.wait_for_everyone()
         except Exception:
@@ -914,6 +922,9 @@ class DGPOTrainer(BaseTrainer):
         self.compute_advantages(samples, rewards, store_to_samples=True)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
         if adv_metrics:
+            self._maybe_stamp_train_samples_predicted_dump_png_paths(
+                adv_metrics, num_local_rollout_samples=len(samples),
+            )
             self.log_data(adv_metrics, step=self.step)
 
     # =========================== Optimization (Stage 6) ============================

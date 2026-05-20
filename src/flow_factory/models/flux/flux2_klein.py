@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from PIL import Image
 from collections import defaultdict
 import numpy as np
@@ -28,7 +28,7 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, c
 import logging
 
 from ..abc import BaseAdapter
-from ...samples import I2ISample
+from ...samples import I2ISample, DPO_PREFERENCE_CANDIDATE_FLAG
 from ...hparams import *
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
@@ -56,6 +56,49 @@ from ...utils.trajectory_collector import (
 from ...utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
+
+
+def _retrieve_latents_from_encoder_output(
+    encoder_output: Any,
+    generator: Optional[torch.Generator] = None,
+    sample_mode: str = "argmax",
+) -> torch.Tensor:
+    """Same contract as diffusers `retrieve_latents` (Flux2 VAE encode output)."""
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    if hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    raise AttributeError("Could not access latents of encoder_output for DPO preference packing")
+
+
+def _letterbox_rgb_pil_exact_hw(pil_image: Image.Image, *, width: int, height: int) -> Image.Image:
+    """Uniformly scale ``pil_image`` to fit inside ``width``×``height``, centered on a white RGB canvas.
+
+    Used for DPO preference images so arbitrary on-disk aspect ratios (e.g. phase4 outputs) match the
+    online rollout's ``template.width`` / ``template.height`` before VAE encode, without dataset-time
+    resizing (resolution comes from training rollout, not JSONL).
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"letterbox target size must be positive, got width={width} height={height}")
+    im = pil_image.convert("RGB")
+    w, h = im.size
+    if w <= 0 or h <= 0:
+        raise ValueError(f"source image must have positive size, got {w=} {h=}")
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS  # type: ignore[attr-defined]
+    scale = min(float(width) / float(w), float(height) / float(h))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    resized = im.resize((nw, nh), resample)
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    ox = (width - nw) // 2
+    oy = (height - nh) // 2
+    canvas.paste(resized, (ox, oy))
+    return canvas
 
 
 @dataclass
@@ -368,7 +411,64 @@ class Flux2KleinAdapter(BaseAdapter):
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
 
         return images
-    
+
+    @torch.no_grad()
+    def dpo_clone_sample_with_preference_image(
+        self,
+        template: Flux2KleinSample,
+        pil_image: Image.Image,
+        metadata_key_to_drop: str,
+    ) -> Flux2KleinSample:
+        """Packs an RGB candidate into the same latent space as the final inference trajectory step.
+
+        The candidate is **letterboxed on white** to ``template.width`` × ``template.height`` (from the
+        online rollout) so phase4 or other external PNGs match sampling resolution without resizing at
+        dataset build time.
+        """
+        if template.height is None or template.width is None:
+            raise ValueError(
+                f"template.height and template.width are required for DPO preference packing, "
+                f"got height={template.height!r} width={template.width!r}"
+            )
+        pipe = self.pipeline
+        device = self.device
+        dtype = pipe.vae.dtype
+        th, tw = int(template.height), int(template.width)
+        img = _letterbox_rgb_pil_exact_hw(pil_image.convert("RGB"), width=tw, height=th)
+        pipe.image_processor.check_image_input(img)
+        img_bchw = pipe.image_processor.preprocess(
+            img, height=th, width=tw, resize_mode="crop"
+        ).to(device=device, dtype=dtype)
+        latent_dist = pipe.vae.encode(img_bchw)
+        latents = _retrieve_latents_from_encoder_output(
+            latent_dist, generator=None, sample_mode="argmax"
+        )
+        latents = pipe._patchify_latents(latents)
+        bn_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        bn_std = torch.sqrt(
+            pipe.vae.bn.running_var.view(1, -1, 1, 1) + pipe.vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
+        latents = (latents - bn_mean) / bn_std
+        packed = pipe._pack_latents(latents)
+        all_latents = packed
+
+        image_pt = pipe.image_processor.postprocess(img_bchw, output_type="pt")[0]
+
+        clean_extra = {
+            k: v
+            for k, v in template.extra_kwargs.items()
+            if k != metadata_key_to_drop
+        }
+        clean_extra[DPO_PREFERENCE_CANDIDATE_FLAG] = True
+        return replace(
+            template,
+            timesteps=template.timesteps,
+            all_latents=all_latents,
+            log_probs=None,
+            image=image_pt,
+            extra_kwargs=clean_extra,
+        )
+
     # ======================== Inference ========================
     # Since Flux.2 does not support ragged batches of condition images, we implement a single-sample inference method.
     @torch.no_grad()

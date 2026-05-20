@@ -34,11 +34,18 @@ from ..data_utils.loader import get_dataloader
 from ..data_utils.dataset import (
     attach_per_sample_metadata_for_inference,
     materialize_jsonl_image_column_for_inference,
+    _resolve_path,
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
-from ..samples import BaseSample
+from ..logger.formatting import (
+    ROLLOUT_DUMP_EVAL_FLAT_INDEX_KEY,
+    ROLLOUT_DUMP_GENERATED_IMAGE_ABS_KEY,
+    ROLLOUT_DUMP_JUDGE_TRANSCRIPT_JSON_ABS_KEY,
+    ROLLOUT_DUMP_SAMPLES_JSONL_ABS_KEY,
+)
+from ..samples import BaseSample, DPO_PREFERENCE_CANDIDATE_FLAG
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -98,6 +105,119 @@ class BaseTrainer(ABC):
     def show_progress_bar(self) -> bool:
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
+
+    def _eval_samples_for_logger(self, samples: List[BaseSample]) -> List[BaseSample]:
+        """Slice eval samples for WandB/SwanLab media; ``None`` cap keeps full list."""
+        cap = self.log_args.log_max_eval_samples
+        if cap is None:
+            return samples
+        if cap <= 0:
+            return []
+        return samples[:cap]
+
+    def _predicted_rollout_artifact_output_dir_abs(self, subdir: str, leaf_dir_name: str) -> str:
+        """Absolute path matching :func:`eval_dump.dump_eval_artifacts` ``output_dir`` layout."""
+        run_name = "" if self.log_args.run_name is None else str(self.log_args.run_name)
+        root = os.path.join(str(self.log_args.save_dir), run_name, subdir.strip())
+        return os.path.abspath(os.path.join(root, leaf_dir_name))
+
+    def _gather_object_flat_start_index(self, num_local_items: int) -> int:
+        """Index of this rank's first sample in ``gather_object(local_sample_lists)`` order (ranks 0..R-1)."""
+        if num_local_items < 0:
+            raise ValueError(
+                f"gather-object flat-start: num_local_items must be >= 0, got {num_local_items!r}"
+            )
+        nt = torch.tensor([int(num_local_items)], dtype=torch.long, device=self.accelerator.device)
+        collected = self.accelerator.gather(nt)
+        sizes = collected.detach().cpu().reshape(-1).tolist()
+        proc = int(self.accelerator.process_index)
+        nproc = int(self.accelerator.num_processes)
+        if len(sizes) != nproc:
+            raise RuntimeError(
+                f"gather-object flat-start: expected accelerator.gather length {nproc}, got {len(sizes)} "
+                f"(tensor shape {tuple(collected.shape)})"
+            )
+        if proc < 0 or proc >= len(sizes):
+            raise RuntimeError(
+                f"gather-object flat-start: invalid process_index={proc} for sizes len={len(sizes)}"
+            )
+        return int(sum(int(s) for s in sizes[:proc]))
+
+    def _stamp_predicted_rollout_dump_eval_log_paths(
+        self,
+        logged_samples: List[BaseSample],
+        *,
+        flat_start_index: int,
+        out_dir_abs: str,
+    ) -> None:
+        """Predicted paths for ``dump_eval_artifacts`` outputs (NDJSON row + optional judge JSON + PNG)."""
+        out_root = os.path.abspath(out_dir_abs)
+        img_root_abs = os.path.join(out_root, "images")
+        jsonl_abs = os.path.join(out_root, "samples.jsonl")
+        judge_root_abs = os.path.join(out_root, "judge_transcripts")
+        for offset, sample in enumerate(logged_samples):
+            if not isinstance(sample, BaseSample):
+                raise TypeError(
+                    f"rollout dump path stamp: expected BaseSample at offset {offset}, "
+                    f"got {type(sample).__name__}: {sample!r}"
+                )
+            g = int(flat_start_index) + int(offset)
+            gen_png = os.path.join(img_root_abs, f"sample_{g:05d}_generated.png")
+            judge_json = os.path.join(judge_root_abs, f"sample_{g:05d}.json")
+            sample.extra_kwargs[ROLLOUT_DUMP_GENERATED_IMAGE_ABS_KEY] = os.path.abspath(gen_png)
+            sample.extra_kwargs[ROLLOUT_DUMP_SAMPLES_JSONL_ABS_KEY] = os.path.abspath(jsonl_abs)
+            sample.extra_kwargs[ROLLOUT_DUMP_EVAL_FLAT_INDEX_KEY] = g
+            sample.extra_kwargs[ROLLOUT_DUMP_JUDGE_TRANSCRIPT_JSON_ABS_KEY] = os.path.abspath(judge_json)
+
+    def _stamp_eval_logged_samples_predicted_dump_png_paths_if_enabled(
+        self,
+        logged_eval_samples: List[BaseSample],
+        *,
+        flat_start_index: int,
+        eval_status: str,
+    ) -> None:
+        """Main process only; matches :meth:`_gather_eval_samples_and_maybe_dump` leaf naming."""
+        if not self.accelerator.is_main_process:
+            return
+        if not self.eval_args.eval_dump_enable:
+            return
+        if not str(self.log_args.save_dir).strip():
+            return
+        subdir = (self.eval_args.eval_dump_subdir or "eval_results").strip()
+        leaf = f"epoch_{self.epoch:04d}_step_{self.step:06d}_{eval_status}"
+        out_abs = self._predicted_rollout_artifact_output_dir_abs(subdir, leaf)
+        self._stamp_predicted_rollout_dump_eval_log_paths(
+            logged_eval_samples,
+            flat_start_index=flat_start_index,
+            out_dir_abs=out_abs,
+        )
+
+    def _maybe_stamp_train_samples_predicted_dump_png_paths(
+        self,
+        adv_metrics: Dict[str, Any],
+        *,
+        num_local_rollout_samples: int,
+    ) -> None:
+        """Append predicted dump paths to ``train_samples`` media when train dump runs this epoch."""
+        if not self.training_args.train_dump_enable:
+            return
+        freq = self.training_args.train_dump_freq
+        if freq < 1 or self.epoch % freq != 0:
+            return
+        if not str(self.log_args.save_dir).strip():
+            return
+        ts = adv_metrics.get("train_samples")
+        if not isinstance(ts, list) or not ts:
+            return
+        flat_start = self._gather_object_flat_start_index(int(num_local_rollout_samples))
+        subdir = (self.training_args.train_dump_subdir or "eval_results").strip()
+        leaf = f"train_epoch_{self.epoch:04d}_step_{self.step:06d}"
+        out_abs = self._predicted_rollout_artifact_output_dir_abs(subdir, leaf)
+        self._stamp_predicted_rollout_dump_eval_log_paths(
+            ts,
+            flat_start_index=flat_start,
+            out_dir_abs=out_abs,
+        )
 
     def should_continue_training(self) -> bool:
         """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
@@ -190,6 +310,7 @@ class BaseTrainer(ABC):
             global_std=getattr(self.training_args, 'global_std', True),
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
+            max_train_samples_for_log=self.log_args.log_max_train_samples,
         )
 
         return self.reward_models, self.eval_reward_models
@@ -576,6 +697,75 @@ class BaseTrainer(ABC):
             return
         for sample in samples:
             sample.to('cpu')
+
+    def _inject_preference_candidates(self, sample_batch: List[BaseSample]) -> List[BaseSample]:
+        """Append preference-image candidates after a complete rollout group.
+
+        ``sample_batch`` must contain ``group_size`` policy rollouts sharing the same
+        ``sample.unique_id``. This method emits those K samples followed by
+        ``preference_extra_candidates`` packed clones.
+
+        Requires the adapter to implement ``dpo_clone_sample_with_preference_image``.
+        """
+        n_extra = getattr(self.training_args, 'preference_extra_candidates', 0)
+        if n_extra <= 0:
+            return sample_batch
+        key = self.training_args.preference_candidate_metadata_key
+        base_dir = self.config.data_args.dataset_dir
+        expected_k = int(self.training_args.group_size)
+        if len(sample_batch) != expected_k:
+            raise ValueError(
+                f"`_inject_preference_candidates` expected exactly "
+                f"group_size ({expected_k}) rollout samples before preference injection; "
+                f"got {len(sample_batch)}."
+            )
+        group_uid = sample_batch[0].unique_id
+        if any(s.unique_id != group_uid for s in sample_batch[1:]):
+            raise ValueError(
+                "Preference injection received a rollout list whose members do not "
+                f"share one `unique_id`; unique_ids={sorted({s.unique_id for s in sample_batch})!r}"
+            )
+
+        template = sample_batch[0]
+        raw_paths = template.extra_kwargs.get(key)
+        if raw_paths is None:
+            raise KeyError(
+                f"preference_extra_candidates={n_extra} requires extra_kwargs[{key!r}] on each "
+                f"rollout sample (unique_id={group_uid})."
+            )
+        if not isinstance(raw_paths, list):
+            raise TypeError(
+                f"{key!r} must be a list of image path strings, got {type(raw_paths).__name__} "
+                f"(unique_id={group_uid})"
+            )
+        if len(raw_paths) != n_extra:
+            raise ValueError(
+                f"{key!r} must have length {n_extra} (= preference_extra_candidates), "
+                f"got {len(raw_paths)} for unique_id={group_uid}."
+            )
+
+        out: List[BaseSample] = list(sample_batch)
+        for rel in raw_paths:
+            if not isinstance(rel, str) or not rel.strip():
+                raise ValueError(
+                    f"Invalid image path in {key!r}: {rel!r} (unique_id={group_uid})"
+                )
+            path = _resolve_path(base_dir, rel)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"Preference candidate image not found: {path!r} (from {rel!r}, unique_id={group_uid})"
+                )
+            pil = Image.open(path).convert("RGB")
+            out.append(
+                self.adapter.dpo_clone_sample_with_preference_image(
+                    template, pil, key
+                )
+            )
+        return out
+
+    @staticmethod
+    def _is_preference_candidate_sample(sample: BaseSample) -> bool:
+        return sample.extra_kwargs.get(DPO_PREFERENCE_CANDIDATE_FLAG) is True
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
         """Save trainer state to a specific path."""

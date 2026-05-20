@@ -57,7 +57,35 @@ class LogArguments(ArgABC):
         metadata={"help": "Whether to print detailed progress during training."},
     )
 
+    log_max_train_samples: int = field(
+        default=30,
+        metadata={
+            "help": (
+                "Max number of training samples included in each `train_samples` media log payload. "
+                "0 disables sample images (scalars still log). Metrics use the full batch regardless."
+            ),
+        },
+    )
+
+    log_max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Max eval samples in `eval_samples` media per eval step. None = all gathered samples. "
+                "0 disables eval sample images. Full `all_samples` are still used for eval_dump."
+            ),
+        },
+    )
+
     def __post_init__(self):
+        if self.log_max_train_samples < 0:
+            raise ValueError(
+                f"log_max_train_samples must be >= 0, got {self.log_max_train_samples!r}"
+            )
+        if self.log_max_eval_samples is not None and self.log_max_eval_samples < 0:
+            raise ValueError(
+                f"log_max_eval_samples must be None or >= 0, got {self.log_max_eval_samples!r}"
+            )
 
         # Expand path to user's path
         self.save_dir = os.path.expanduser(self.save_dir)

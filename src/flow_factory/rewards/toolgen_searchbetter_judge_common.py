@@ -120,7 +120,77 @@ def write_toolgen_judge_unparsed_response_dump(
 
 JUDGE_SYSTEM_PROMPT = (
     "You are an image quality evaluator. Be rigorous and evidence-based. "
-    "Output strict XML only, using the root element <evaluation> and the required tag names."
+    "Output strict XML only, using the root element <evaluation> and the required tag names.\n\n"
+    "Follow these steps in order:\n\n"
+    "Step 1 — Task understanding\n"
+    "- user_prompt: identify required subjects, attributes, actions, scene, style, quality, and in-image text.\n"
+    "- verification_checklist: map each item to concrete visual evidence that satisfies or violates it.\n"
+    "- evaluation_rubric: clarify what each dimension judges.\n"
+    "- visual_reference_context: identify reference-dependent criteria.\n"
+    "- textual_knowledge_gap_context: critical/important textual gaps from prompt analysis (metadata only); "
+    "what factual or textual elaboration the target should reflect.\n\n"
+    "Step 2 — Image roles\n"
+    "- 'Reference image N' = comparison evidence only. Never score reference image quality.\n"
+    "- 'Image to assess' = the only image scored.\n\n"
+    "Step 3 — Evidence extraction (observable facts only, no inference)\n"
+    "  a) Subjects & identity — entities, distinguishing traits, count.\n"
+    "  b) Attributes — clothing, colors, materials, textures, proportions.\n"
+    "  c) Actions & poses — gestures, interactions, body language.\n"
+    "  d) Scene & environment — setting, background, weather, time of day.\n"
+    "  e) Composition — framing, spatial arrangement, depth, balance.\n"
+    "  f) Color & lighting — palette, light direction, shadows, consistency.\n"
+    "  g) Style — artistic medium, realism level, stylistic cues.\n"
+    "  h) In-image text — content, legibility, spelling, placement.\n"
+    "  i) Physical plausibility — anatomy (hands, faces, limbs), object physics, spatial consistency.\n"
+    "  j) Artifacts — blur, aliasing, seams, duplications, impossible geometry.\n"
+    "  k) AI tells — unnatural smoothness, plastic textures, warped backgrounds, uncanny features.\n\n"
+    "Step 4 — Reference comparison\n"
+    "- Compare target against references for reference-dependent criteria.\n"
+    "- Note which identity traits are preserved, altered, or missing.\n"
+    "- Map each reference to the checklist items and rubric dimensions it informs.\n\n"
+    "Step 5 — Scoring scale (0–3, half-points allowed)\n"
+    "  0 = Not met / contradicted.  1 = Weak, major issues.\n"
+    "  2 = Mostly met, minor issues.  3 = Fully met, correct and coherent.\n\n"
+    "Step 5b — Auditable scores (each scored row's <reason>)\n"
+    "Use three lines in order: (1) Anchor: <0…3 in 0.5 steps> — why, with Step 3 cite. "
+    "(2) Adjustments: bullets \"Δ=±0.5|±1 …\" each with evidence, or \"none\". "
+    "(3) Computed final: X — X must equal Anchor+ΣΔ (clamp to [0,3], 0.5 steps) and MUST match <score>. "
+    "reference_alignment: 2–4 sentences only, no Anchor template.\n\n"
+    "Step 6 — Score checklist and rubric\n"
+    "Score each checklist item, each task-specific rubric dimension, and ALL generic dimensions below.\n"
+    "Every scored row's <reason> follows Step 5b.\n\n"
+    "  prompt_faithfulness — Are all requested subjects, attributes, actions, scene, and style present and accurate?\n\n"
+    "  image_quality — Visual clarity/sharpness? Artifacts or defects? "
+    "Style/lighting/perspective coherence? Physical plausibility and anatomy correctness?\n\n"
+    "  text_rendering — If no in-image text is required and none is present, leave the score element empty in XML; "
+    "otherwise give a score in 0–3. Does rendered text match required content? Readable? Spelled? Placed well?\n\n"
+    "  ai_naturalness — Does the image look AI-generated? Check: organic texture realism vs AI smoothness? "
+    "Fine-detail plausibility vs uncanny uniformity? Environment grounded vs dreamlike/generic? "
+    "Would a careful viewer readily identify this as AI-generated?\n\n"
+    "  composition_and_aesthetics — Well-framed and balanced? Clear depth and spatial arrangement? "
+    "Color harmony and consistent lighting? Visually appealing overall?\n\n"
+    "Step 7 — Visual reference fidelity\n"
+    "- Set visual_reference applicable=true only if visual references are provided in the evaluation context.\n"
+    "- When applicable, compare the target image against each reference for identity preservation, attribute "
+    "consistency, and style fidelity. Check: are key facial features / distinguishing traits maintained? "
+    "Are colors, textures, and proportions consistent? Is the overall style preserved?\n"
+    "- Score preservation of critical identity, attributes, and style from references onto the target.\n"
+    "- When applicable, visual_reference <reason> follows Step 5b.\n\n"
+    "Step 7b — Textual knowledge / textual elaboration fidelity\n"
+    "- Set text_reference applicable=true only if textual knowledge gaps are listed in the evaluation context.\n"
+    "- Using gap metadata (entity, reasoning, suggested lookup intent) and visible target evidence only, score how "
+    "correctly the image renders what those gaps require (facts, labels, standards, wording, numbers, symbols, etc.).\n"
+    "- Do not use live web search.\n"
+    "- When applicable, text_reference <reason> follows Step 5b.\n\n"
+    "Step 8 — Consistency checks\n"
+    "- Computed final = <score> for every scored row; reasons must match scores.\n"
+    "- Reasons and scores must not contradict. Major failures → score < 2. Minor-only issues → score > 1.\n"
+    "- When a rubric score applies, use values in {0, 0.5, 1, 1.5, 2, 2.5, 3}. When a dimension does not apply, "
+    "leave that dimension's <score> empty (no characters between the tags).\n"
+    "- Include a dimension element for every required rubric row; all numeric scores are for the target image only.\n\n"
+    "Output the target image evaluation as a single XML block. "
+    "No preface, no code fences, no text after the root element. "
+    "Escape <, >, & in text (e.g. &amp;)."
 )
 
 # Default judge XML root (parse path: :func:`parse_judge_xml_to_dict`).
@@ -230,6 +300,8 @@ JUDGE_OUTPUT_XML_COMPACT_EXAMPLE = (
 TOOLGEN_JUDGE_LABELED_SCORES_KEY = "_toolgen_judge_labeled_scores"
 # Preserved when ``toolgen_group_drop_constant_score_dims`` strips live labeled vectors (for logging).
 TOOLGEN_JUDGE_LABELED_SCORES_LOG_CACHE = "_toolgen_judge_labeled_scores_log_cache"
+# Full judge call record (Frontier / HTTP ToolGen judges) for SFT replay; stored on every call.
+TOOLGEN_JUDGE_TRANSCRIPT_KEY = "_toolgen_judge_transcript"
 
 # Required generic rubric keys always requested in the judge prompt; may be absent from dataset YAML.
 REQUIRED_GENERIC_RUBRIC_DIMS = frozenset(
@@ -438,10 +510,21 @@ def _slot_reference_focus(
         return "unknown", "unknown", "No reasoning provided."
 
     meta = url_to_meta.get(ref_slot_url, {})
-    entity = str(meta.get("entity") or "unknown").strip()
-    severity = str(meta.get("severity") or "unknown").strip()
+    entity = str(meta.get("entity") or "").strip()
+    severity = str(meta.get("severity") or "").strip()
     reasoning = str(meta.get("candidate_reasoning") or "").strip()
-    return entity, severity, reasoning or "No reasoning provided."
+
+    # Fallback: if URL didn't match the map, use critical_candidates by slot index
+    if not entity:
+        cands = visual_context.get("critical_candidates")
+        if isinstance(cands, list) and 0 <= slot_index < len(cands):
+            c = cands[slot_index]
+            if isinstance(c, dict):
+                entity = str(c.get("entity") or "unknown").strip()
+                severity = str(c.get("severity") or "unknown").strip()
+                reasoning = str(c.get("reasoning") or "").strip()
+
+    return entity or "unknown", severity or "unknown", reasoning or "No reasoning provided."
 
 
 def interleaved_ref_context_block(
@@ -496,15 +579,7 @@ def build_eval_prompt_text(
     image_layout_lines: List[str] = []
     for i, ref_url in enumerate(reference_slot_urls):
         entity, severity, reasoning = _slot_reference_focus(visual_context, i, url_to_meta, ref_url)
-        if len(reasoning) > 220:
-            reasoning = reasoning[:217].rstrip() + "..."
-        image_layout_lines.extend(
-            [
-                f"Reference image {i + 1}: <image>",
-                f"- Reference focus: entity='{entity}', severity='{severity}'",
-                f"- Why this reference matters: {reasoning or 'No reasoning provided.'}",
-            ]
-        )
+        image_layout_lines.append(f"Reference image {i + 1} (entity={entity}): <image>")
     image_layout_lines.append("Image to assess: <image>")
     image_layout_text = "\n".join(image_layout_lines)
 
@@ -564,131 +639,81 @@ def build_eval_prompt_text(
     text_knowledge_focus_text = "\n".join(text_knowledge_lines) if text_knowledge_lines else "None."
     has_text_knowledge = bool(visual_context.get("has_text_knowledge_gaps_for_eval"))
 
-    instructions = (
-        "You are an evaluator. Produce accurate scores from evidence, not guessing.\n"
-        "Use all evaluation context: user_prompt, verification_checklist, evaluation_rubric, "
-        "visual_reference_context, web_knowledge_gap_context.\n\n"
-        f"Image layout (slot order):\n{image_layout_text}\n\n"
-        "Follow these steps in order:\n\n"
-        "Step 1 — Task understanding\n"
-        "- user_prompt: identify required subjects, attributes, actions, scene, style, quality, and in-image text.\n"
-        "- verification_checklist: map each item to concrete visual evidence that satisfies or violates it.\n"
-        "- evaluation_rubric: clarify what each dimension judges.\n"
-        "- visual_reference_context: identify reference-dependent criteria.\n"
-        "- web_knowledge_gap_context: critical/important web-typed gaps from prompt analysis (metadata only); "
-        "what factual or textual elaboration the target should reflect.\n\n"
-        "Step 2 — Image roles\n"
-        "- 'Reference image N' = comparison evidence only. Never score reference image quality.\n"
-        "- 'Image to assess' = the only image scored.\n\n"
-        "Step 3 — Evidence extraction (observable facts only, no inference)\n"
-        "  a) Subjects & identity — entities, distinguishing traits, count.\n"
-        "  b) Attributes — clothing, colors, materials, textures, proportions.\n"
-        "  c) Actions & poses — gestures, interactions, body language.\n"
-        "  d) Scene & environment — setting, background, weather, time of day.\n"
-        "  e) Composition — framing, spatial arrangement, depth, balance.\n"
-        "  f) Color & lighting — palette, light direction, shadows, consistency.\n"
-        "  g) Style — artistic medium, realism level, stylistic cues.\n"
-        "  h) In-image text — content, legibility, spelling, placement.\n"
-        "  i) Physical plausibility — anatomy (hands, faces, limbs), object physics, spatial consistency.\n"
-        "  j) Artifacts — blur, aliasing, seams, duplications, impossible geometry.\n"
-        "  k) AI tells — unnatural smoothness, plastic textures, warped backgrounds, uncanny features.\n\n"
-        "Step 4 — Reference comparison\n"
-        "- Compare target against references for reference-dependent criteria.\n"
-        "- Note which identity traits are preserved, altered, or missing.\n"
-        "- Map each reference to the checklist items and rubric dimensions it informs.\n\n"
-        "Step 5 — Scoring scale (0–3, half-points allowed)\n"
-        "  0 = Not met / contradicted.  1 = Weak, major issues.\n"
-        "  2 = Mostly met, minor issues.  3 = Fully met, correct and coherent.\n\n"
-        "Step 5b — Auditable scores (each scored row's <reason>)\n"
-        "Use three lines in order: (1) Anchor: <0…3 in 0.5 steps> — why, with Step 3 cite. "
-        "(2) Adjustments: bullets \"Δ=±0.5|±1 …\" each with evidence, or \"none\". "
-        "(3) Computed final: X — X must equal Anchor+ΣΔ (clamp to [0,3], 0.5 steps) and MUST match <score>. "
-        "reference_alignment: 2–4 sentences only, no Anchor template.\n\n"
-        "Step 6 — Score checklist and rubric\n"
-        "Score each checklist item, each task-specific rubric dimension, and ALL generic dimensions below.\n"
-        "Every scored row's <reason> follows Step 5b.\n\n"
-        "  prompt_faithfulness — Are all requested subjects, attributes, actions, scene, and style present and accurate?\n\n"
-        "  image_quality — Visual clarity/sharpness? Artifacts or defects? "
-        "Style/lighting/perspective coherence? Physical plausibility and anatomy correctness?\n\n"
-        "  text_rendering — If no in-image text is required and none is present, leave the score element empty in XML; "
-        "otherwise give a score in 0–3. Does rendered text match required content? Readable? Spelled? Placed well?\n\n"
-        "  ai_naturalness — Does the image look AI-generated? Check: organic texture realism vs AI smoothness? "
-        "Fine-detail plausibility vs uncanny uniformity? Environment grounded vs dreamlike/generic? "
-        "Would a careful viewer readily identify this as AI-generated?\n\n"
-        "  composition_and_aesthetics — Well-framed and balanced? Clear depth and spatial arrangement? "
-        "Color harmony and consistent lighting? Visually appealing overall?\n\n"
-        "Step 7 — Visual reference fidelity\n"
-        "- Set visual_reference applicable=true only if has_critical_references=true in Evaluation context.\n"
-        "- Score preservation of critical identity, attributes, and style from references onto the target.\n"
-        "- When applicable, visual_reference <reason> follows Step 5b.\n\n"
-        "Step 7b — Web knowledge / textual elaboration fidelity\n"
-        "- Set text_reference applicable=true only if has_text_knowledge_gaps_for_eval=true in Evaluation context.\n"
-        "- Using gap metadata (entity, reasoning, suggested lookup intent) and visible target evidence only, score how "
-        "correctly the image renders what those gaps require (facts, labels, standards, wording, numbers, symbols, etc.).\n"
-        "- Do not use live web search.\n"
-        "- When applicable, text_reference <reason> follows Step 5b.\n\n"
-        "Step 8 — Consistency checks\n"
-        "- Computed final = <score> for every scored row; reasons must match scores.\n"
-        "- Reasons and scores must not contradict. Major failures → score < 2. Minor-only issues → score > 1.\n"
-        "- When a rubric score applies, use values in {0, 0.5, 1, 1.5, 2, 2.5, 3}. When a dimension does not apply, "
-        "leave that dimension's <score> empty (no characters between the tags).\n"
-        "- Include a dimension element for every required rubric row; all numeric scores are for the target image only.\n\n"
-        "Output the target image evaluation as a single XML block. "
-        "No preface, no code fences, no text after the root element. "
-        "Escape <, >, & in text (e.g. &amp;).\n\n"
-        "Blocks:\n"
+    # --- Build conditional sections ---
+    has_visual_refs = bool(visual_context.get("has_critical_references")) and len(reference_slot_urls) > 0
+
+    visual_ref_section = ""
+    if has_visual_refs:
+        visual_ref_section = (
+            "\nVisual-reference setup:\n"
+            f"- attached_reference_images: {len(reference_slot_urls)}\n"
+            f"- used_reference_images_count (from generation): {reference_counts.get('used_reference_images_count')}\n"
+            "- critical reference focus:\n"
+            f"{critical_focus_text}\n"
+            "- Guideline: Compare the target image against each reference for identity preservation (facial features, "
+            "distinguishing traits), attribute consistency (colors, textures, proportions), and style fidelity. "
+            "Penalize missing or altered identity traits; reward faithful reproduction.\n"
+        )
+
+    textual_knowledge_section = ""
+    if has_text_knowledge and text_knowledge_lines:
+        textual_knowledge_section = (
+            "\nTextual knowledge gap (textual reference):\n"
+            f"- gap_count: {len(text_knowledge_lines)}\n"
+            "- gaps to assess (metadata only; no retrieved search text):\n"
+            f"{text_knowledge_focus_text}\n"
+            "- Guideline: Using the gap metadata (entity, reasoning, suggested lookup intent) and visible evidence "
+            "in the target image only, assess whether the image correctly renders the factual/textual content "
+            "these gaps describe (labels, numbers, symbols, standards, proper nouns, etc.).\n"
+        )
+
+    # --- Build XML output format block ---
+    xml_format_block = (
+        "XML output blocks:\n"
         f"1) reference_alignment — one {JUDGE_XML_ALIGNMENT_ITEM} per reference slot "
-        f"(attribute {JUDGE_XML_REF_ATTR}=\"Reference image k\" matching the prompt layout): "
+        f"(attribute {JUDGE_XML_REF_ATTR}=\"Reference image k\" matching the image layout): "
         f"{JUDGE_XML_CHECKLIST_LINKS} and {JUDGE_XML_RUBRIC_LINKS} (plain text or multiple {JUDGE_XML_LINK} children "
         "for checklist phrases / rubric dimension names), then reason (how the reference should influence judgment "
-        "of the target only).\n\n"
+        "of the target only).\n"
         f"2) checklist — one {JUDGE_XML_CHECKLIST_ITEM} per verification line (optional {JUDGE_XML_I_ATTR}="
         f"0-based index): {JUDGE_XML_CRITERION} (the checklist line being scored), reason (Step 5b), "
-        "score (always present and numeric).\n\n"
+        "score (always present and numeric).\n"
         f"3) rubric — one {JUDGE_XML_DIMENSION} per task-specific and generic row (attribute {JUDGE_XML_NAME_ATTR}="
-        "exact dimension name): reason (Step 5b), then score; if N/A, empty <score> and brief reason.\n\n"
-        f"4) visual_reference — {JUDGE_XML_APPLICABLE} true/false; when true: Step 5b reason + score; when false: short reason, score=0.\n\n"
+        "exact dimension name): reason (Step 5b), then score; if N/A, empty <score> and brief reason.\n"
+        f"4) visual_reference — {JUDGE_XML_APPLICABLE} true/false; when true: Step 5b reason + score; when false: short reason, score=0.\n"
         f"5) text_reference — {JUDGE_XML_APPLICABLE} true/false; when true: Step 5b reason + score; when false: short reason, score=0.\n\n"
         f"Row ordering: if all {JUDGE_XML_CHECKLIST_ITEM} rows carry a non-empty {JUDGE_XML_I_ATTR} attribute, "
         "ascending index order; otherwise document order.\n\n"
         f"{JUDGE_OUTPUT_XML_SHAPE_FENCED}\n"
     )
 
-    evaluation_context = (
-        f"Trajectory ID: {row.get('trajectory_id')}\n"
-        f"Request index: {row.get('request_index')}\n"
-        f"Variant: {variant}\n\n"
+    # --- Assemble user message (query-specific only) ---
+    parts: List[str] = []
+
+    parts.append(
+        "Evaluation context:\n\n"
         "Task prompt:\n"
         f"{user_prompt or 'N/A'}\n\n"
         "Verification checklist:\n"
         f"{checklist_text}\n\n"
         "Evaluation rubric:\n"
-        f"{rubric_text_with_required_generic}\n\n"
-        "Visual-reference setup:\n"
-        f"- has_critical_references: {bool(visual_context.get('has_critical_references'))}\n"
-        f"- attached_reference_images: {len(reference_slot_urls)}\n"
-        f"- used_reference_images_count (from generation): {reference_counts.get('used_reference_images_count')}\n"
-        "- critical reference focus:\n"
-        f"{critical_focus_text}\n\n"
-        "Web knowledge gap setup (from analysis; critical/important, search_type=web only):\n"
-        f"- has_text_knowledge_gaps_for_eval: {has_text_knowledge}\n"
-        f"- web_knowledge_gap_count: {len(text_knowledge_lines)}\n"
-        "- gaps to assess (metadata only; no retrieved search text):\n"
-        f"{text_knowledge_focus_text}\n\n"
-        "Scoring scale:\n"
-        "- checklist: 0–3 (half-points allowed)\n"
-        "- rubric: 0–3 (half-points allowed; leave text_rendering score empty when not applicable per instructions)\n"
-        "- visual reference fidelity: 0–3 (half-points allowed)\n"
-        "- text / web knowledge gap fidelity: 0–3 (half-points allowed)"
+        f"{rubric_text_with_required_generic}"
     )
 
-    return (
-        "Instructions:\n"
-        f"{instructions}\n\n"
-        "Evaluation context:\n"
-        f"{evaluation_context}\n\n"
+    if visual_ref_section:
+        parts.append(visual_ref_section)
+
+    if textual_knowledge_section:
+        parts.append(textual_knowledge_section)
+
+    parts.append(f"\n\n{xml_format_block}")
+
+    parts.append(
+        f"\nImage layout (slot order):\n{image_layout_text}\n\n"
         f"Return strict XML only (single <{JUDGE_XML_ROOT_TAG}> document; no legacy <{LEGACY_JUDGE_XML_ROOT}>).\n"
     )
+
+    return "\n".join(parts)
 
 
 def build_judge_interleaved_user_content(
@@ -1454,6 +1479,62 @@ def _score_to_float_03(x: Any, *, ctx: str) -> float:
     if v < 0.0 or v > 3.0:
         raise ValueError(f"{ctx}: score must be in [0, 3], got {v}")
     return v
+
+
+def toolgen_dpo_decompose_major_rest_native03(
+    labeled: List[Tuple[str, float]],
+) -> Tuple[float, float]:
+    """
+    Decompose ToolGen judge labeled scores for DPO pair **selection** (not reward replacement).
+
+    **Major total** (native ``[0, 3]`` per component, same shaping as training logs):
+    ``prompt_faithfulness`` + mean(task rubric / adaptive rows) + mean(checklist items).
+
+    **Rest total**: sum of all other native scores — generic rubric dims except
+    ``prompt_faithfulness``, plus ``visual_reference_evaluation`` and
+    ``text_reference_evaluation``, and any unrecognized keys.
+
+    Returns:
+        (major_total, rest_sum) both in cumulative native scale (major up to ~9 if all max;
+        rest scales with number of minor dimensions).
+    """
+    if not isinstance(labeled, list) or not labeled:
+        raise ValueError(f"labeled must be non-empty list, got {labeled!r}")
+
+    pf = 0.0
+    pf_seen = False
+    adaptive_vals: List[float] = []
+    checklist_vals: List[float] = []
+    rest_vals: List[float] = []
+
+    for k, v in labeled:
+        if not isinstance(k, str):
+            raise TypeError(f"labeled key must be str, got {type(k).__name__}: {k!r}")
+        if k.startswith("checklist:"):
+            checklist_vals.append(float(v))
+            continue
+        if k.startswith("rubric:"):
+            dim = k[len("rubric:") :]
+            if dim == "prompt_faithfulness":
+                pf = float(v)
+                pf_seen = True
+            elif dim in REQUIRED_GENERIC_RUBRIC_DIMS:
+                rest_vals.append(float(v))
+            else:
+                adaptive_vals.append(float(v))
+            continue
+        if k in ("visual_reference_evaluation", "text_reference_evaluation"):
+            rest_vals.append(float(v))
+            continue
+        rest_vals.append(float(v))
+
+    if not pf_seen:
+        pf = 0.0
+    ad_m = sum(adaptive_vals) / len(adaptive_vals) if adaptive_vals else 0.0
+    ch_m = sum(checklist_vals) / len(checklist_vals) if checklist_vals else 0.0
+    major_total = float(pf) + float(ad_m) + float(ch_m)
+    rest_sum = float(sum(rest_vals)) if rest_vals else 0.0
+    return major_total, rest_sum
 
 
 def parsed_judge_labeled_scores_03(parsed: Dict[str, Any]) -> List[Tuple[str, float]]:

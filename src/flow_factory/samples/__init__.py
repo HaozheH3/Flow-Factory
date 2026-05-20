@@ -15,6 +15,7 @@
 # src/flow_factory/samples/__init__.py
 
 from .samples import (
+    DPO_PREFERENCE_CANDIDATE_FLAG,
     BaseSample,
     ImageConditionSample,
     VideoConditionSample,
@@ -29,6 +30,7 @@ from .samples import (
 
 
 __all__ = [
+    "DPO_PREFERENCE_CANDIDATE_FLAG",
     # Sample classes
     "BaseSample",
     "ImageConditionSample",

@@ -25,7 +25,17 @@ from PIL import Image
 import imageio
 from typing import Any, Dict, List, Union, Optional, Tuple
 from dataclasses import dataclass, is_dataclass, asdict, field
-from ..samples import BaseSample, T2ISample, T2VSample, T2AVSample, I2ISample, I2VSample, I2AVSample, V2VSample
+from ..samples import (
+    BaseSample,
+    DPO_PREFERENCE_CANDIDATE_FLAG,
+    T2ISample,
+    T2VSample,
+    T2AVSample,
+    I2ISample,
+    I2VSample,
+    I2AVSample,
+    V2VSample,
+)
 from ..utils.base import (
     # Image utils
     numpy_to_pil_image,
@@ -42,8 +52,16 @@ from ..utils.base import (
     normalize_video_to_uint8,
 )
 from ..utils.logger_utils import setup_logger
+from ..data_utils.dataset import _resolve_path
 
 logger = setup_logger(__name__)
+
+# Keys stamped on rollout samples before media logging when eval/train dumps are enabled.
+# Paths match ``utils.eval_dump.dump_eval_artifacts`` (NDJSON rows align with flat gather order).
+ROLLOUT_DUMP_GENERATED_IMAGE_ABS_KEY = "_rollout_dump_generated_image_abs"
+ROLLOUT_DUMP_SAMPLES_JSONL_ABS_KEY = "_rollout_dump_samples_jsonl_abs"
+ROLLOUT_DUMP_EVAL_FLAT_INDEX_KEY = "_rollout_dump_eval_flat_index"
+ROLLOUT_DUMP_JUDGE_TRANSCRIPT_JSON_ABS_KEY = "_rollout_dump_judge_transcript_json_abs"
 
 
 # ------------------------------------------- Helper Functions -------------------------------------------
@@ -54,6 +72,33 @@ def _compute_optimal_grid(n: int) -> Tuple[int, int]:
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
     return (rows, cols)
+
+def _concat_images_horizontal_same_height(images: List[Image.Image]) -> Image.Image:
+    """Paste images left-to-right, scaling each to a common target height (preserves aspect)."""
+    if not images:
+        raise ValueError("Empty image list")
+    if len(images) == 1:
+        return images[0]
+    target_h = max(im.size[1] for im in images)
+    resized: List[Image.Image] = []
+    for im in images:
+        w, h = im.size
+        if h == 0:
+            raise ValueError("image has zero height")
+        new_w = max(1, int(round(w * (target_h / h))))
+        resized.append(
+            im.resize((new_w, target_h), Image.Resampling.LANCZOS)
+            if im.size != (new_w, target_h)
+            else im
+        )
+    total_w = sum(im.size[0] for im in resized)
+    out = Image.new("RGB", (total_w, target_h))
+    x = 0
+    for im in resized:
+        out.paste(im.convert("RGB"), (x, 0))
+        x += im.size[0]
+    return out
+
 
 def _concat_images_grid(images: List[Image.Image]) -> Image.Image:
     """Concatenate images into optimal grid layout."""
@@ -85,6 +130,8 @@ def _to_pil_list(images: Union[Image.Image, List[Image.Image], torch.Tensor, np.
         return numpy_to_pil_image(images)
 
     if isinstance(images, list):
+        if len(images) == 0:
+            return []
         if isinstance(images[0], Image.Image):
             return images
         elif isinstance(images[0], torch.Tensor):
@@ -172,6 +219,29 @@ def _build_sample_caption(sample : BaseSample, max_length: Optional[int] = None)
                 parts.append(", ".join(f"{k}: {v:.2f}" for k, v in rewards.items()))
     if sample.prompt:
         parts.append(sample.prompt[:max_length] + "..." if (max_length is not None and len(sample.prompt) > max_length) else sample.prompt)
+
+    idx_raw = sample.extra_kwargs.get(ROLLOUT_DUMP_EVAL_FLAT_INDEX_KEY)
+    ei: Optional[int]
+    if idx_raw is None:
+        ei = None
+    elif torch.is_tensor(idx_raw):
+        ei = int(idx_raw.detach().cpu().item())
+    else:
+        ei = int(idx_raw)
+
+    jsl = sample.extra_kwargs.get(ROLLOUT_DUMP_SAMPLES_JSONL_ABS_KEY)
+    if isinstance(jsl, str) and jsl.strip():
+        if ei is None:
+            raise RuntimeError(
+                f"caption: missing {ROLLOUT_DUMP_EVAL_FLAT_INDEX_KEY!r} alongside "
+                f"{ROLLOUT_DUMP_SAMPLES_JSONL_ABS_KEY!r}"
+            )
+        parts.append(f"eval_dump_jsonl={jsl} eval_dump_index={ei}")
+
+    jt = sample.extra_kwargs.get(ROLLOUT_DUMP_JUDGE_TRANSCRIPT_JSON_ABS_KEY)
+    if isinstance(jt, str) and jt.strip():
+        parts.append(f"eval_judge_transcript_json={jt}")
+
     return " | ".join(parts)
 
 def _compute_resize_dims(
@@ -720,13 +790,285 @@ class LogTable:
             rows.append(row)
         
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
-    
+
     def cleanup(self):
         """Remove all temporary files from contained LogImage/LogVideo items."""
         for row in self.rows:
             for item in row:
                 if item is not None and hasattr(item, 'cleanup'):
                     item.cleanup()
+
+
+def _dpo_aggregated_reward_score(
+    sample: BaseSample,
+    reward_weights: Dict[str, float],
+    *,
+    display_floor_non_negative: bool = True,
+) -> float:
+    """Weighted sum of ``extra_kwargs['rewards']`` (same weighting as DPO :meth:`_get_aggregated_reward`).
+
+    When ``display_floor_non_negative``, captions never show negative aggregates (selection may still use
+    unclamped modified scores elsewhere).
+    """
+    rew_map = sample.extra_kwargs.get("rewards")
+    if rew_map is None or len(rew_map) == 0:
+        return float("nan")
+    total = 0.0
+    for name, val in rew_map.items():
+        w = float(reward_weights.get(name, 1.0))
+        vv = val.item() if torch.is_tensor(val) else float(val)
+        total += w * vv
+    if display_floor_non_negative and math.isfinite(total):
+        return max(0.0, total)
+    return total
+
+
+def _format_dpo_log_score(x: float) -> str:
+    if isinstance(x, float) and x != x:
+        return "nan"
+    return f"{x:.4f}"
+
+
+def build_dpo_preference_pair_log_images(
+    pairs: List[Tuple[BaseSample, BaseSample]],
+    max_pairs: int,
+    reward_weights: Dict[str, float],
+) -> List[LogImage]:
+    """One ``LogImage`` per prompt: conditions (if any), then chosen, then rejected (left-to-right).
+
+    Caption uses weighted reward scores (pre-advantage), floored at 0 for display only.
+    """
+    out: List[LogImage] = []
+    for idx, (chosen_s, rejected_s) in enumerate(pairs[:max_pairs]):
+        if chosen_s.unique_id != rejected_s.unique_id:
+            raise ValueError(
+                f"DPO preference pair row {idx}: chosen unique_id={chosen_s.unique_id!r} != "
+                f"rejected unique_id={rejected_s.unique_id!r}"
+            )
+        if chosen_s.image is None or rejected_s.image is None:
+            continue
+        uid = chosen_s.unique_id
+        score_w = _dpo_aggregated_reward_score(chosen_s, reward_weights)
+        score_l = _dpo_aggregated_reward_score(rejected_s, reward_weights)
+        cond_raw = getattr(chosen_s, "condition_images", None)
+        cond_pils = _to_pil_list(cond_raw)
+        c_pil = LogImage.to_pil(chosen_s.image)
+        r_pil = LogImage.to_pil(rejected_s.image)
+        strip_in = [*cond_pils, c_pil, r_pil] if cond_pils else [c_pil, r_pil]
+        strip = _concat_images_horizontal_same_height(strip_in)
+        cap = (
+            f"uid={uid} chosen_score={_format_dpo_log_score(score_w)} "
+            f"rejected_score={_format_dpo_log_score(score_l)} "
+            f"| {_build_sample_caption(chosen_s)}"
+        )
+        out.append(LogImage(strip, caption=cap))
+    return out
+
+
+def build_dpo_all_candidate_images_log_images(
+    samples: List[BaseSample],
+    max_groups: int,
+    reward_weights: Dict[str, float],
+    *,
+    include_condition_images_in_strip: bool = False,
+    trim_to_candidate_count: int | None = None,
+) -> List[LogImage]:
+    """One ``LogImage`` per ``unique_id`` — policy **rollout** images, then injected preference clones.
+
+    Logged under ``train/dpo_all_candidate_images``. Rollouts exclude
+    ``extra_kwargs[DPO_PREFERENCE_CANDIDATE_FLAG]`` rows; injected panels are VAE-packed preference
+    clones (same flag True). Strip order: optional ``condition_images``, then rollouts
+    (left-to-right), then injected candidates.
+
+    If ``trim_to_candidate_count`` is a positive int, at most that many **injected** clones are
+    shown after the rollout segment; if ``None`` (training default), every flagged clone for that
+    prompt is included.
+
+    Dedupes duplicate samples per ``unique_id`` by Python ``id()``.
+    """
+    rollout_groups: Dict[Any, List[BaseSample]] = {}
+    rollout_seen: Dict[Any, set[int]] = {}
+    injected_groups: Dict[Any, List[BaseSample]] = {}
+    injected_seen: Dict[Any, set[int]] = {}
+
+    for s in samples:
+        uid = s.unique_id
+        sid = id(s)
+        if s.extra_kwargs.get(DPO_PREFERENCE_CANDIDATE_FLAG):
+            if uid not in injected_seen:
+                injected_seen[uid] = set()
+            if sid in injected_seen[uid]:
+                continue
+            injected_seen[uid].add(sid)
+            injected_groups.setdefault(uid, []).append(s)
+            continue
+        if s.image is None:
+            continue
+        if uid not in rollout_seen:
+            rollout_seen[uid] = set()
+        if sid in rollout_seen[uid]:
+            continue
+        rollout_seen[uid].add(sid)
+        rollout_groups.setdefault(uid, []).append(s)
+
+    out: List[LogImage] = []
+    shown = 0
+    for uid in injected_groups:
+        if shown >= max_groups:
+            break
+        cands = injected_groups[uid]
+        # Prefer logging every flagged preference clone for this uid (count matches
+        # preference_extra_candidates after injection). Truncate only when callers pass a cap.
+        if trim_to_candidate_count is not None and int(trim_to_candidate_count) >= 1:
+            cands = cands[: int(trim_to_candidate_count)]
+        if any(s.image is None for s in cands):
+            continue
+        rollouts = rollout_groups.get(uid, [])
+        inj_scores = [_dpo_aggregated_reward_score(s, reward_weights) for s in cands]
+        roll_scores = [_dpo_aggregated_reward_score(s, reward_weights) for s in rollouts]
+        inj_finite = [
+            float(x) for x in inj_scores if isinstance(x, (int, float)) and math.isfinite(float(x))
+        ]
+        roll_finite = [
+            float(x) for x in roll_scores if isinstance(x, (int, float)) and math.isfinite(float(x))
+        ]
+        mean_inj = (
+            float(np.mean(np.array(inj_finite, dtype=np.float64))) if inj_finite else float("nan")
+        )
+        mean_roll = (
+            float(np.mean(np.array(roll_finite, dtype=np.float64)))
+            if roll_finite
+            else float("nan")
+        )
+
+        template = cands[0]
+        cond_pils = _to_pil_list(getattr(template, "condition_images", None))
+        roll_pils = [LogImage.to_pil(s.image) for s in rollouts]
+        inj_pils = [LogImage.to_pil(s.image) for s in cands]
+        body = [*roll_pils, *inj_pils]
+        strip_in = ([*cond_pils, *body] if include_condition_images_in_strip else body)
+
+        strip = _concat_images_horizontal_same_height(strip_in)
+        if include_condition_images_in_strip:
+            if cond_pils:
+                strip_desc = (
+                    f"strip=conds_plus_rollout_plus_injected({len(cond_pils)}+{len(roll_pils)}+{len(inj_pils)})"
+                )
+            else:
+                strip_desc = (
+                    f"strip=rollout_plus_injected({len(roll_pils)}+{len(inj_pils)})"
+                )
+        else:
+            strip_desc = f"strip=rollout_plus_injected({len(roll_pils)}+{len(inj_pils)})"
+
+        score_parts: List[str] = []
+        for i in range(min(len(roll_scores), 12)):
+            score_parts.append(
+                f"roll{i}_score={_format_dpo_log_score(roll_scores[i])}"
+            )
+        if len(roll_scores) > 12:
+            score_parts.append("roll_...")
+        for i in range(min(len(inj_scores), 12)):
+            score_parts.append(f"inj{i}_score={_format_dpo_log_score(inj_scores[i])}")
+        if len(inj_scores) > 12:
+            score_parts.append("inj_...")
+
+        cap = (
+            f"dpo_all_candidate_images uid={uid} num_condition_images={len(cond_pils)} {strip_desc}; "
+            f"mean_rollout_reward={_format_dpo_log_score(mean_roll)} "
+            f"mean_injected_reward={_format_dpo_log_score(mean_inj)} "
+            + " ".join(score_parts)
+            + f" | {_build_sample_caption(template)}"
+        )
+        out.append(LogImage(strip, caption=cap))
+        shown += 1
+    return out
+
+
+def build_dpo_dataset_preference_candidate_images(
+    samples: List[BaseSample],
+    max_groups: int,
+    *,
+    dataset_dir: str,
+    candidate_metadata_key: str,
+    include_condition_images_in_strip: bool = False,
+) -> List[LogImage]:
+    """One ``LogImage`` per ``unique_id`` — horizontal strip of dataset PNG paths from JSON metadata.
+
+    Loads **every** string path in ``extra_kwargs[candidate_metadata_key]`` (same list DPO injection
+    uses), left-to-right. Optionally prepends ``condition_images`` like
+    :func:`build_dpo_all_candidate_images_log_images`.
+
+    Logged under ``train/dpo_dataset_preference_candidate_images``. Skips rollout samples marked
+    ``dpo_is_preference_candidate``; uses the first non-candidate row per ``unique_id`` as template.
+    """
+    seen_uid: set[Any] = set()
+    uid_order: List[Any] = []
+    templates: Dict[Any, BaseSample] = {}
+    for s in samples:
+        if s.extra_kwargs.get(DPO_PREFERENCE_CANDIDATE_FLAG):
+            continue
+        uid = s.unique_id
+        if uid in seen_uid:
+            continue
+        seen_uid.add(uid)
+        uid_order.append(uid)
+        templates[uid] = s
+
+    out: List[LogImage] = []
+    shown = 0
+    base = str(dataset_dir).strip()
+    if not base:
+        return out
+
+    for uid in uid_order:
+        if shown >= max_groups:
+            break
+        tpl = templates[uid]
+        raw = tpl.extra_kwargs.get(candidate_metadata_key)
+        if not isinstance(raw, list) or len(raw) == 0:
+            continue
+        cond_pils = _to_pil_list(getattr(tpl, "condition_images", None))
+        path_pils: List[Image.Image] = []
+        rels_logged: List[str] = []
+        for j, rel in enumerate(raw):
+            if not isinstance(rel, str) or not rel.strip():
+                raise ValueError(
+                    f"DPO media log: invalid path in {candidate_metadata_key!r} at index {j}: {rel!r} "
+                    f"(unique_id={uid})"
+                )
+            path = _resolve_path(base, rel.strip())
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"DPO media log: dataset preference image missing: {path!r} (metadata index {j}, "
+                    f"unique_id={uid})"
+                )
+            path_pils.append(Image.open(path).convert("RGB"))
+            rels_logged.append(rel.strip())
+
+        strip_in = (
+            [*cond_pils, *path_pils] if include_condition_images_in_strip else path_pils
+        )
+        strip = _concat_images_horizontal_same_height(strip_in)
+        if include_condition_images_in_strip:
+            strip_desc = (
+                f"strip=conds_plus_paths({len(cond_pils)}+{len(path_pils)})"
+                if cond_pils
+                else f"strip=paths_only({len(path_pils)})"
+            )
+        else:
+            strip_desc = f"strip=paths_only({len(path_pils)})"
+
+        cap = (
+            f"dpo_dataset_preference_candidate_images uid={uid} num_condition_images={len(cond_pils)} "
+            f"{strip_desc} metadata_key={candidate_metadata_key!r} "
+            f"dataset_relpaths={rels_logged!r} "
+            f"| {_build_sample_caption(tpl)}"
+        )
+        out.append(LogImage(strip, caption=cap))
+        shown += 1
+    return out
+
 
 # ----------------------------------- LogFormatter Class -----------------------------------
 class LogFormatter:
@@ -880,6 +1222,13 @@ class LogFormatter:
             value = [value]
         if cls._is_sample_collection(value):
             return cls._process_sample_list(value)
+
+        if isinstance(value, LogTable):
+            return value
+
+        # Prefer LogImage lists for media (don't treat mean heuristically)
+        if isinstance(value, (list, tuple)) and len(value) > 0 and isinstance(value[0], LogImage):
+            return list(value)
 
         # Rule 1: PIL Image
         if isinstance(value, Image.Image):

@@ -15,7 +15,8 @@
 """
 ToolGen SearchBetter-style multimodal judge rewards.
 
-- ``ToolGenSearchBetterJudgeRewardModel``: OpenAI-compatible HTTP (AsyncOpenAI).
+- ``ToolGenSearchBetterJudgeRewardModel``: OpenAI-compatible HTTP (AsyncOpenAI), e.g. **vLLM**
+  ``--api-key EMPTY`` servers exposing ``/v1/chat/completions``.
 - ``ToolGenSearchBetterJudgeFrontierRewardModel``: Alibaba Frontier / llm-chat-api via ToolGen
   ``frontier_model.FrontierModel`` (see ``toolgen_searchbetter_judge_common.import_toolgen_frontier_model``).
 
@@ -29,6 +30,7 @@ prompt (**original** user instruction). See :func:`build_eval_prompt_text`.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -169,14 +171,24 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
     uses as "Task prompt" (checklist and rubric apply to that text). Do not pass refined text in
     ``user_prompt``.
 
-    ``extra_kwargs`` (subset): ``api_base_url``, ``api_key``, ``vlm_model``, ``max_concurrent``,
-    ``max_retries``, ``timeout``, ``temperature``, ``max_tokens``, ``max_pixels`` (per image_url,
-    default ``589824``), ``variant`` (string tag in the evaluation context, default ``training``).
+    ``extra_kwargs`` (subset): ``api_base_url`` (e.g. ``http://host:port/v1`` for vLLM), ``api_key``,
+    ``vlm_model`` (must match the served model id), ``max_concurrent``, ``max_retries``, ``timeout``,
+    ``temperature``, ``max_tokens``, ``max_pixels`` (per ``image_url``; default ``262144`` for
+    ``reward_model: toolgen_searchbetter_judge_vllm``, else ``589824``), ``variant``
+    (default ``training``). Use the **same**
+    ``frontier_judge_error_policy`` / ``frontier_judge_penalty_value`` names as
+    :class:`ToolGenSearchBetterJudgeFrontierRewardModel` so YAML can switch transport-only: ``raise``
+    (default) or ``penalize`` with ``frontier_judge_penalty_value`` (default ``0.0``). Judge call
+    transcripts are **always** returned in ``extra_info['judge_transcript_batch']`` and attached to
+    samples as ``extra_kwargs['_toolgen_judge_transcript']`` (same payload shape as Frontier disk dumps;
+    HTTP path has no separate ``frontier_judge_dump_dir`` unless configured elsewhere).
     After transport retries, **one** extra full judge completion is attempted when the reply is
-    empty, unparsable as XML/JSON, or fails labeled-score extraction; only then errors propagate.
+    empty, unparsable as XML/JSON, or fails labeled-score extraction; only then errors propagate (or
+    penalize, see above).
     ``toolgen_judge_unparsed_dump_dir`` (optional path): when the judge reply cannot be parsed as
     XML/JSON, write the full raw assistant string to a ``*.judge_unparsed.txt`` file under this
     directory (see also env ``FLOW_FACTORY_JUDGE_UNPARSED_DUMP_DIR`` / ``TOOLGEN_JUDGE_UNPARSED_DUMP_DIR``).
+    ``FLOW_FACTORY_JUDGE_RUN_ID`` prefixes unparsed dumps and transcript ``call_id`` when set.
     Aggregated reward (see :func:`flow_factory.rewards.toolgen_searchbetter_judge_common.parsed_judge_json_to_weighted_reward`):
     ``toolgen_judge_checklist_item_weight`` (default ``1``) for **checklist** sub-aspect renormalization;
     ``toolgen_judge_major_aspect_weights`` (optional dict) for renormalized weights across **major** terms
@@ -214,7 +226,9 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
         self.timeout = float(config.extra_kwargs.get("timeout", 180.0))
         self.temperature = float(config.extra_kwargs.get("temperature", 0.2))
         self.max_tokens = int(config.extra_kwargs.get("max_tokens", 8000))
-        self.max_pixels = int(config.extra_kwargs.get("max_pixels", 589824))
+        _rm = str(config.reward_model or "").strip().lower()
+        _default_max_pixels = 262144 if _rm == "toolgen_searchbetter_judge_vllm" else 589824
+        self.max_pixels = int(config.extra_kwargs.get("max_pixels", _default_max_pixels))
         self.variant = str(config.extra_kwargs.get("variant", "training"))
         self._judge_reward_weights = {
             "checklist_item_weight": float(
@@ -225,18 +239,25 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
             ),
         }
 
+        raw_policy = str(config.extra_kwargs.get("frontier_judge_error_policy", "raise")).strip().lower()
+        if raw_policy not in {"raise", "penalize"}:
+            raise ValueError(
+                f"frontier_judge_error_policy must be 'raise' or 'penalize', got {raw_policy!r}"
+            )
+        self._error_policy: str = raw_policy
+        self._penalty_value = float(config.extra_kwargs.get("frontier_judge_penalty_value", 0.0))
+
         self.client = AsyncOpenAI(base_url=self.api_base_url, api_key=self.api_key)
         self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+
+        env_run = os.environ.get("FLOW_FACTORY_JUDGE_RUN_ID")
+        self._judge_artifact_run_id = (
+            str(env_run).strip() if isinstance(env_run, str) and env_run.strip() else uuid.uuid4().hex[:12]
+        )
 
         self._unparsed_dump_dir = resolve_toolgen_judge_unparsed_response_dump_dir(config.extra_kwargs)
         if self._unparsed_dump_dir is not None:
             self._unparsed_dump_dir.mkdir(parents=True, exist_ok=True)
-            env_run = os.environ.get("FLOW_FACTORY_JUDGE_RUN_ID")
-            self._judge_artifact_run_id = (
-                str(env_run).strip() if isinstance(env_run, str) and env_run.strip() else uuid.uuid4().hex[:12]
-            )
-        else:
-            self._judge_artifact_run_id = ""
 
     @torch.no_grad()
     def __call__(
@@ -307,8 +328,9 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
         meta_checklists = [as_str_list(verification_checklist[i], sample_index=i) for i in range(batch_len)]
         meta_rubrics = [as_rubric_dict(evaluation_rubric[i], sample_index=i) for i in range(batch_len)]
 
-        scores, labeled_batch = asyncio.run(
+        scores, labeled_batch, transcript_batch = asyncio.run(
             self._async_score_batch(
+                batch_len=batch_len,
                 user_prompts=[str(user_prompt[i]) for i in range(batch_len)],
                 edited=image,
                 ref_lists=ref_lists,
@@ -320,13 +342,16 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
             )
         )
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
-        return RewardModelOutput(
-            rewards=rewards,
-            extra_info={"judge_labeled_scores_batch": labeled_batch},
-        )
+        extra_info: Dict[str, Any] = {
+            "judge_labeled_scores_batch": labeled_batch,
+            "judge_transcript_batch": transcript_batch,
+        }
+        return RewardModelOutput(rewards=rewards, extra_info=extra_info)
 
     async def _async_score_batch(
         self,
+        *,
+        batch_len: int,
         user_prompts: List[str],
         edited: List[Image.Image],
         ref_lists: List[List[Image.Image]],
@@ -335,10 +360,15 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
         aug_details: List[Any],
         traj_ids: List[str],
         req_indices: List[Any],
-    ) -> tuple[List[float], List[List[tuple[str, float]]]]:
+    ) -> tuple[
+        List[float],
+        List[Optional[List[tuple[str, float]]]],
+        List[Optional[Dict[str, Any]]],
+    ]:
         tasks = [
             self._score_single(
                 intra_batch_index=i,
+                batch_len=batch_len,
                 user_prompt=user_prompts[i],
                 edited=edited[i],
                 refs=ref_lists[i],
@@ -353,12 +383,43 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
         pairs = list(await asyncio.gather(*tasks))
         scores = [p[0] for p in pairs]
         labeled = [p[1] for p in pairs]
-        return scores, labeled
+        transcripts = [p[2] for p in pairs]
+        return scores, labeled, transcripts
+
+    def _http_openai_judge_fail(
+        self,
+        *,
+        base: Dict[str, Any],
+        status: str,
+        message: str,
+        redacted_interleaved: Optional[List[Dict[str, Any]]],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> tuple[float, None, Optional[Dict[str, Any]]]:
+        row = {**base, "status": status, "error": message, "reward": None}
+        if extra:
+            row.update(extra)
+        if redacted_interleaved is not None:
+            row["interleaved_redacted"] = redacted_interleaved
+        transcript = dict(row)
+        if self._error_policy == "raise":
+            if status in ("parse_error", "empty_response", "invalid_parsed_output"):
+                raise ValueError(message)
+            raise RuntimeError(
+                f"ToolGenSearchBetterJudge sample failed ({status}): {message}"
+            )
+        logger.warning(
+            "ToolGenSearchBetterJudge: frontier_judge_error_policy=penalize -> reward=%s (%s: %s)",
+            self._penalty_value,
+            status,
+            _truncate_text(message, 500),
+        )
+        return float(self._penalty_value), None, transcript
 
     async def _score_single(
         self,
         *,
         intra_batch_index: int,
+        batch_len: int,
         user_prompt: str,
         edited: Image.Image,
         refs: List[Image.Image],
@@ -367,8 +428,27 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
         aug_detail: Any,
         trajectory_id: str,
         request_index: Any,
-    ) -> tuple[float, List[tuple[str, float]]]:
-        from openai import APIConnectionError, APITimeoutError, RateLimitError
+    ) -> tuple[float, Optional[List[tuple[str, float]]], Optional[Dict[str, Any]]]:
+        from openai import APIConnectionError, APIError, APITimeoutError, RateLimitError
+
+        call_id = _make_judge_response_dump_stem(
+            run_id=self._judge_artifact_run_id,
+            intra_batch_index=intra_batch_index,
+            trajectory_id=str(trajectory_id or ""),
+            request_index=request_index,
+            suffix="call",
+        )
+        base = {
+            "ts": time.time(),
+            "call_id": call_id,
+            "intra_batch_index": intra_batch_index,
+            "batch_len": batch_len,
+            "model_name": self.vlm_model,
+            "trajectory_id": trajectory_id,
+            "request_index": request_index,
+            "user_prompt_preview": _truncate_text(str(user_prompt), 800),
+            "api_timeout_sec": float(self.timeout),
+        }
 
         slot_urls = reference_slot_placeholders(len(refs))
         ref_data_urls = [pil_image_to_base64(r, format="PNG") for r in refs]
@@ -402,6 +482,8 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
             max_pixels=self.max_pixels,
         )
 
+        redacted_interleaved = _redact_interleaved_for_dump(interleaved)
+
         messages = [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": interleaved},
@@ -427,10 +509,20 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
                     if attempt + 1 >= self.max_retries:
                         break
                     await asyncio.sleep(2**attempt)
+                except APIError as e:
+                    last_transport_err = e
+                    break
             if completion is None:
-                raise RuntimeError(
-                    f"ToolGenSearchBetterJudge HTTP request failed after {self.max_retries} attempt(s)"
-                ) from last_transport_err
+                msg = f"HTTP request failed after {self.max_retries} attempt(s)"
+                return self._http_openai_judge_fail(
+                    base=base,
+                    status="request_failed",
+                    message=f"{type(last_transport_err).__name__}: {last_transport_err}"
+                    if last_transport_err is not None
+                    else msg,
+                    redacted_interleaved=redacted_interleaved,
+                    extra={"api_summary": None},
+                )
 
             content = completion.choices[0].message.content
             if content is None or not str(content).strip():
@@ -441,8 +533,11 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
                         TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
                     )
                     continue
-                raise ValueError(
-                    "Judge returned empty assistant content; cannot parse ToolGen-style judge output"
+                return self._http_openai_judge_fail(
+                    base=base,
+                    status="empty_response",
+                    message="Judge returned empty assistant content; cannot parse ToolGen-style judge output",
+                    redacted_interleaved=redacted_interleaved,
                 )
 
             raw = str(content)
@@ -473,9 +568,15 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
                             "status": "parse_error",
                         },
                     )
-                raise ValueError(
-                    "Failed to parse strict XML/JSON from judge response; "
-                    f"first 500 chars: {raw[:500]!r}"
+                return self._http_openai_judge_fail(
+                    base=base,
+                    status="parse_error",
+                    message=(
+                        "Failed to parse strict XML/JSON from judge response; "
+                        f"first 500 chars: {raw[:500]!r}"
+                    ),
+                    redacted_interleaved=redacted_interleaved,
+                    extra={"response_text": raw[:500_000]},
                 )
 
             try:
@@ -494,11 +595,35 @@ class ToolGenSearchBetterJudgeRewardModel(PointwiseRewardModel):
                         TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
                     )
                     continue
-                raise
+                return self._http_openai_judge_fail(
+                    base=base,
+                    status="invalid_parsed_output",
+                    message=f"{type(exc).__name__}: {exc}",
+                    redacted_interleaved=redacted_interleaved,
+                    extra={"response_text": raw[:500_000], "parsed": parsed},
+                )
 
-            return reward, labeled
+            out = {
+                **base,
+                "status": "ok",
+                "error": None,
+                "response_text": raw,
+                "parsed": parsed,
+                "labeled_scores_03": labeled,
+                "reward": reward,
+            }
+            if redacted_interleaved is not None:
+                out["interleaved_redacted"] = redacted_interleaved
 
-        raise RuntimeError("ToolGenSearchBetterJudge: exhausted parse completion retries without success")
+            transcript = dict(out)
+            return reward, labeled, transcript
+
+        return self._http_openai_judge_fail(
+            base=base,
+            status="exhausted_retries",
+            message="ToolGenSearchBetterJudge: no successful completion after parse retries",
+            redacted_interleaved=redacted_interleaved,
+        )
 
 
 class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
@@ -558,6 +683,12 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
       Successful members must share the same score key ordering (same checklist/rubric layout).
     - ``toolgen_retain_labeled_scores_in_samples`` (bool, default ``False``): if true, keep
       ``extra_kwargs['_toolgen_judge_labeled_scores']`` after adjustment; otherwise it is removed to save memory.
+    - Judge transcripts are **always** stored per sample as ``extra_kwargs['_toolgen_judge_transcript']``
+      (same payload shape as ``frontier_judge_dump_dir`` ``*.json``). Eval snapshots with ``eval_dump_enable``
+      write ``judge_transcripts/sample_*.json``.
+    - ``toolgen_attach_judge_transcript_plain_image_urls`` (bool, default ``False``): store full multimodal ``data:``
+      image URLs under ``interleaved_with_data_urls`` in the transcript instead of redacted placeholders
+      (very large on disk — use only for local SFT export).
     """
 
     required_fields = (
@@ -667,6 +798,15 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
         if self._unparsed_dump_dir is not None:
             self._unparsed_dump_dir.mkdir(parents=True, exist_ok=True)
 
+        self._transcript_plain_urls = bool(
+            config.extra_kwargs.get("toolgen_attach_judge_transcript_plain_image_urls", False)
+        )
+        if self._transcript_plain_urls:
+            FRONTIER_JUDGE_LOG.warning(
+                "toolgen_attach_judge_transcript_plain_image_urls=True embeds full data: URLs in "
+                "_toolgen_judge_transcript (very large RAM/disk)."
+            )
+
     def _make_eval_dump_stem(
         self,
         *,
@@ -725,10 +865,11 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
         dump_stem: Optional[str],
         edited: Image.Image,
         extra: Optional[Dict[str, Any]] = None,
-    ) -> float:
+    ) -> tuple[float, Optional[Dict[str, Any]]]:
         row = {**base, "status": status, "error": message, "reward": None}
         if extra:
             row.update(extra)
+        transcript = dict(row)
         if dump_stem is not None:
             self._persist_eval_artifact_pair(dump_stem, row, edited)
         FRONTIER_JUDGE_LOG.warning(
@@ -750,7 +891,7 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
             base.get("call_id"),
             self._penalty_value,
         )
-        return float(self._penalty_value)
+        return float(self._penalty_value), transcript
 
     def _score_one_sync(
         self,
@@ -765,7 +906,7 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
         aug_detail: Any,
         trajectory_id: str,
         request_index: Any,
-    ) -> tuple[float, Optional[List[tuple[str, float]]]]:
+    ) -> tuple[float, Optional[List[tuple[str, float]]], Optional[Dict[str, Any]]]:
         dump_stem: Optional[str] = None
         if self._dump_dir is not None:
             dump_stem = self._make_eval_dump_stem(
@@ -818,9 +959,12 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
             max_pixels=self.max_pixels,
         )
 
-        dump_request: Optional[List[Dict[str, Any]]] = None
-        if self._dump_dir is not None and self._dump_redacted_request:
-            dump_request = _redact_interleaved_for_dump(interleaved)
+        redacted_interleaved: Optional[List[Dict[str, Any]]] = None
+        need_redacted = (self._dump_dir is not None and self._dump_redacted_request) or (
+            not self._transcript_plain_urls
+        )
+        if need_redacted:
+            redacted_interleaved = _redact_interleaved_for_dump(interleaved)
 
         for parse_try in range(TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES):
             try:
@@ -834,28 +978,31 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                     timeout=self._api_timeout,
                 )
             except Exception as exc:
-                r = self._fail_sample(
+                r, tr = self._fail_sample(
                     base=base,
                     status="request_exception",
                     message=f"{type(exc).__name__}: {exc}",
                     dump_stem=dump_stem,
                     edited=edited,
-                    extra={"interleaved_redacted": dump_request, "api_summary": None},
+                    extra={"interleaved_redacted": redacted_interleaved, "api_summary": None},
                 )
-                return r, None
+                return r, None, tr
 
             api_summary = _summarize_api_result(result)
             if isinstance(result, dict) and result.get("_error") is not None:
                 err_txt = str(result.get("_error"))
-                r = self._fail_sample(
+                r, tr = self._fail_sample(
                     base=base,
                     status="api_error",
                     message=err_txt,
                     dump_stem=dump_stem,
                     edited=edited,
-                    extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
+                    extra={
+                        "api_summary": api_summary,
+                        "interleaved_redacted": redacted_interleaved,
+                    },
                 )
-                return r, None
+                return r, None, tr
 
             ok, response_text, err = self.frontier.client.extract_message_from_response(result)
             if not ok or response_text is None:
@@ -869,15 +1016,18 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                         TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
                     )
                     continue
-                r = self._fail_sample(
+                r, tr = self._fail_sample(
                     base=base,
                     status="extract_failed",
                     message=f"{msg}; api_summary={api_summary!r}",
                     dump_stem=dump_stem,
                     edited=edited,
-                    extra={"api_summary": api_summary, "interleaved_redacted": dump_request},
+                    extra={
+                        "api_summary": api_summary,
+                        "interleaved_redacted": redacted_interleaved,
+                    },
                 )
-                return r, None
+                return r, None, tr
 
             rt_full = str(response_text)
             rt_stored = _truncate_text(rt_full, self._max_dump_response_chars)
@@ -914,7 +1064,7 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                             "api_summary": api_summary,
                         },
                     )
-                r = self._fail_sample(
+                r, tr = self._fail_sample(
                     base=base,
                     status="parse_error",
                     message=(
@@ -927,10 +1077,10 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                         "api_summary": api_summary,
                         "response_text": rt_stored,
                         "response_truncated": len(rt_stored) < len(rt_full),
-                        "interleaved_redacted": dump_request,
+                        "interleaved_redacted": redacted_interleaved,
                     },
                 )
-                return r, None
+                return r, None, tr
 
             try:
                 labeled = parsed_judge_labeled_scores_03(parsed)
@@ -948,7 +1098,7 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                         TOOLGEN_JUDGE_PARSE_COMPLETION_TRIES,
                     )
                     continue
-                r = self._fail_sample(
+                r, tr = self._fail_sample(
                     base=base,
                     status="invalid_parsed_output",
                     message=f"{type(exc).__name__}: {exc}",
@@ -958,11 +1108,11 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                         "api_summary": api_summary,
                         "response_text": rt_stored,
                         "response_truncated": len(rt_stored) < len(rt_full),
-                        "interleaved_redacted": dump_request,
+                        "interleaved_redacted": redacted_interleaved,
                         "parsed": parsed,
                     },
                 )
-                return r, None
+                return r, None, tr
             out = {
                 **base,
                 "status": "ok",
@@ -974,12 +1124,17 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                 "labeled_scores_03": labeled,
                 "reward": reward,
             }
-            if dump_request is not None:
-                out["interleaved_redacted"] = dump_request
+            if redacted_interleaved is not None:
+                out["interleaved_redacted"] = redacted_interleaved
+
+            transcript = dict(out)
+            if self._transcript_plain_urls:
+                transcript["interleaved_with_data_urls"] = copy.deepcopy(interleaved)
+
             if dump_stem is not None:
                 self._persist_eval_artifact_pair(dump_stem, out, edited)
 
-            return reward, labeled
+            return reward, labeled, transcript
 
         raise RuntimeError(
             "ToolGenSearchBetterJudgeFrontierRewardModel: exhausted parse completion retries without success"
@@ -1077,6 +1232,7 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
         ]
         scores: List[Optional[float]] = [None] * batch_len
         labeled_batch: List[Optional[List[tuple[str, float]]]] = [None] * batch_len
+        transcript_batch: List[Optional[Dict[str, Any]]] = [None] * batch_len
         max_workers = max(1, self.max_concurrent)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_idx: Dict[Any, int] = {}
@@ -1097,12 +1253,14 @@ class ToolGenSearchBetterJudgeFrontierRewardModel(PointwiseRewardModel):
                 future_to_idx[fut] = idx
             for fut in as_completed(future_to_idx):
                 idx = future_to_idx[fut]
-                r, lab = fut.result()
+                r, lab, tr = fut.result()
                 scores[idx] = r
                 labeled_batch[idx] = lab
+                transcript_batch[idx] = tr
 
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
-        return RewardModelOutput(
-            rewards=rewards,
-            extra_info={"judge_labeled_scores_batch": labeled_batch},
-        )
+        extra_info: Dict[str, Any] = {
+            "judge_labeled_scores_batch": labeled_batch,
+            "judge_transcript_batch": transcript_batch,
+        }
+        return RewardModelOutput(rewards=rewards, extra_info=extra_info)

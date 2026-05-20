@@ -67,10 +67,11 @@ class AdvantageProcessor:
         Determines whether cross-rank communication is needed.
     verbose : bool
         Whether to emit progress information.
+    max_train_samples_for_log : int
+        Max samples listed in ``train_samples`` for built-in log payloads; 0 omits images.
 
     Notes
     -----
-    After :meth:`compute_advantages` with ``'sum'`` or ``'gdpo'``, call
     :meth:`pop_advantage_metrics` once to retrieve training metrics (including
     ``train_samples``) for ``log_data``. Custom callables leave an empty metrics
     snapshot. This class does not perform logging itself.
@@ -84,6 +85,7 @@ class AdvantageProcessor:
         global_std: bool = True,
         sampler_type: str = "distributed_k_repeat",
         verbose: bool = True,
+        max_train_samples_for_log: int = 30,
     ):
         self.accelerator = accelerator
         self.reward_weights = reward_weights
@@ -91,6 +93,11 @@ class AdvantageProcessor:
         self.global_std = global_std
         self.sampler_type = sampler_type
         self.verbose = verbose
+        if not isinstance(max_train_samples_for_log, int) or max_train_samples_for_log < 0:
+            raise ValueError(
+                f"max_train_samples_for_log must be int >= 0, got {max_train_samples_for_log!r}"
+            )
+        self.max_train_samples_for_log = max_train_samples_for_log
 
         self.group_on_same_rank = sampler_type == "group_contiguous"
         self._pending_advantage_metrics: Optional[Dict[str, Any]] = None
@@ -571,7 +578,8 @@ class AdvantageProcessor:
         _log_data["train/adv_max"] = adv_stats["max"]
         _log_data["train/adv_abs_mean"] = all_stats["adv_abs"]["mean"]
 
-        _log_data["train_samples"] = samples[:30]
+        cap = self.max_train_samples_for_log
+        _log_data["train_samples"] = samples[:cap] if cap > 0 else []
         self._append_toolgen_judge_subscore_metrics(samples, _log_data)
         return _log_data
 
@@ -638,7 +646,11 @@ class AdvantageProcessor:
             "train/adv_min": adv_stats["min"],
             "train/adv_max": adv_stats["max"],
             "train/adv_abs_mean": all_stats["adv_abs"]["mean"],
-            "train_samples": samples[:30],
+            "train_samples": (
+                samples[: self.max_train_samples_for_log]
+                if self.max_train_samples_for_log > 0
+                else []
+            ),
         })
         self._append_toolgen_judge_subscore_metrics(samples, _log_data)
         return _log_data

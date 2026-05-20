@@ -38,6 +38,9 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'toolgen_searchbetter_judge': (
         'flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeRewardModel'
     ),
+    'toolgen_searchbetter_judge_vllm': (
+        'flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeRewardModel'
+    ),
     'toolgen_searchbetter_judge_frontier': (
         'flow_factory.rewards.toolgen_searchbetter_judge_reward.ToolGenSearchBetterJudgeFrontierRewardModel'
     ),

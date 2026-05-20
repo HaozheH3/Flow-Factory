@@ -342,6 +342,8 @@ class TrainingArguments(ArgABC):
         logger.info("World Size:" + str(world_size))
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
+        # Sampling steps per outer epoch ≈ (unique prompts × rollouts/group) ÷ global micro-batch.
+        # Example: unique_sample_num_per_epoch=64, group_size=5, world 8 × per_device 1 → 320÷8 = 40.
         self.num_batches_per_epoch = (
             (self.unique_sample_num_per_epoch * self.group_size)
             // max(1, sample_num_per_iteration)
@@ -501,6 +503,47 @@ class GRPOTrainingArguments(TrainingArguments):
         metadata={"help": "Device to store reference model parameters."},
     )
 
+    # SFT candidate mode (shared with DPO)
+    sft_candidate_mode: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When true, preference candidates are excluded from RL loss "
+                "and instead trained with a flow-matching velocity MSE (SFT) loss weighted "
+                "by sft_candidate_weight. Requires preference_extra_candidates > 0."
+            ),
+        },
+    )
+    sft_candidate_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Weight multiplier for the SFT diffusion loss on preference candidates "
+                "(only used when sft_candidate_mode=true). "
+                "Final loss = RL_loss + sft_candidate_weight * SFT_loss."
+            ),
+        },
+    )
+    preference_extra_candidates: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of fixed images per prompt group to append after rollouts. "
+                "0 disables. Must match len of metadata list per row "
+                "(see preference_candidate_metadata_key)."
+            ),
+        },
+    )
+    preference_candidate_metadata_key: str = field(
+        default="dpo_preference_candidate_images",
+        metadata={
+            "help": (
+                "Dataset metadata column: list of image paths (length must equal "
+                "preference_extra_candidates on every row)."
+            ),
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
@@ -573,6 +616,47 @@ class NFTTrainingArguments(TrainingArguments):
     ref_param_device: Literal["cpu", "cuda"] = field(
         default="cuda",
         metadata={"help": "Device to store reference model parameters."},
+    )
+
+    # SFT candidate mode (shared with DPO)
+    sft_candidate_mode: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When true, preference candidates are excluded from RL loss "
+                "and instead trained with a flow-matching velocity MSE (SFT) loss weighted "
+                "by sft_candidate_weight. Requires preference_extra_candidates > 0."
+            ),
+        },
+    )
+    sft_candidate_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Weight multiplier for the SFT diffusion loss on preference candidates "
+                "(only used when sft_candidate_mode=true). "
+                "Final loss = RL_loss + sft_candidate_weight * SFT_loss."
+            ),
+        },
+    )
+    preference_extra_candidates: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of fixed images per prompt group to append after rollouts. "
+                "0 disables. Must match len of metadata list per row "
+                "(see preference_candidate_metadata_key)."
+            ),
+        },
+    )
+    preference_candidate_metadata_key: str = field(
+        default="dpo_preference_candidate_images",
+        metadata={
+            "help": (
+                "Dataset metadata column: list of image paths (length must equal "
+                "preference_extra_candidates on every row)."
+            ),
+        },
     )
 
     # Timestep control
@@ -773,6 +857,176 @@ class DPOTrainingArguments(TrainingArguments):
         metadata={"help": "Timestep range for training. Float for [0, value], tuple for [start, end]."},
     )
 
+    # Extra preference candidates (Section 6 / offline pool extension): not sampled from the policy,
+    # but scored and paired like rollout members. Requires adapter support (see Flux2KleinAdapter).
+    preference_extra_candidates: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of fixed images per prompt group to append after rollouts (same unique_id). "
+                "0 disables — standard DPO unchanged. Must match len of metadata list per row "
+                "(see preference_candidate_metadata_key). Reward buffer uses group_size + this value."
+            ),
+        },
+    )
+    preference_candidate_metadata_key: str = field(
+        default="dpo_preference_candidate_images",
+        metadata={
+            "help": (
+                "JSONL / GeneralDataset metadata column: list of image paths (length must equal "
+                "preference_extra_candidates on every row). Same conditioning as rollouts; "
+                "do not merge into condition_images or unique_id will diverge."
+            ),
+        },
+    )
+
+    # SFT candidate mode: candidates excluded from DPO pairs, trained with flow-matching MSE instead
+    sft_candidate_mode: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When true, preference candidates are excluded from DPO pair formation "
+                "and instead trained with a flow-matching velocity MSE (SFT) loss weighted "
+                "by sft_candidate_weight. Requires preference_extra_candidates > 0."
+            ),
+        },
+    )
+    sft_candidate_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Weight multiplier for the SFT diffusion loss on preference candidates "
+                "(only used when sft_candidate_mode=true). "
+                "Final loss = DPO_loss + sft_candidate_weight * SFT_loss."
+            ),
+        },
+    )
+
+    # DPO pair selection: SSIM + ToolGen major-aspect rules (see DPOTrainer)
+    dpo_condition_ssim_enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true, compute max pairwise grayscale SSIM(gen, condition_j) per I2I sample, log "
+                "train/condition_image_ssim and train/high_ssim_rate, and subtract "
+                "dpo_selection_rule_penalty from that sample's pair-selection score when SSIM is "
+                "strictly greater than dpo_penalize_condition_ssim."
+            ),
+        },
+    )
+    dpo_penalize_condition_ssim: float = field(
+        default=0.95,
+        metadata={
+            "help": (
+                "When dpo_condition_ssim_enable, subtract dpo_selection_rule_penalty from the pair "
+                "selection score if max condition SSIM is strictly above this value (in (0, 1])."
+            ),
+        },
+    )
+    dpo_selection_rule_penalty: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Per triggered rule, subtract this from the weighted aggregate reward when forming the "
+                "pair-selection score: (1) high SSIM vs conditions when SSIM is enabled; (2) tied-lowest "
+                "ToolGen major-aspect total within the unique_id group (all ties penalized). Advantages "
+                "and raw per-head rewards are unchanged. Chosen/rejected use the modified score without "
+                "clamping; logged captions floor the displayed aggregate at 0."
+            ),
+        },
+    )
+    dpo_high_ssim_log_threshold: float = field(
+        default=0.9,
+        metadata={
+            "help": (
+                "train/high_ssim_rate counts I2I samples with max condition SSIM strictly greater than this."
+            ),
+        },
+    )
+
+    # Deprecated (ignored): older YAMLs may still set these keys.
+    dpo_chosen_max_condition_ssim: float = field(
+        default=0.9,
+        metadata={"help": "Deprecated; ignored. Former SSIM ceiling for DPO chosen eligibility."},
+    )
+    dpo_penalty_reward_name: str = field(
+        default="judge",
+        metadata={"help": "Deprecated; ignored. Former reward-head rewrite under high SSIM."},
+    )
+    dpo_toolgen_major_gated_pairing_enable: bool = field(
+        default=False,
+        metadata={"help": "Deprecated; ignored. Replaced by worst-major-tie selection penalty."},
+    )
+    dpo_toolgen_major_gated_proxy_reward_name: str = field(
+        default="judge",
+        metadata={"help": "Deprecated; ignored."},
+    )
+
+    # SwanLab / WandB: log chosen|rejected strips (left/right in one image per row) for the same prompt.
+    dpo_log_pair_media_enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true (main process, DPO only), log train/dpo_preference_pairs as a list of "
+                "LogImage strips: condition images (if any), then chosen, then rejected (left-to-right), "
+                "with caption showing weighted reward scores (same aggregation as training, pre-advantage)."
+            ),
+        },
+    )
+    dpo_log_pair_media_max_pairs: int = field(
+        default=16,
+        metadata={"help": "Max number of DPO pairs to log per log event (caps payload size)."},
+    )
+    dpo_log_pair_media_every_epochs: int = field(
+        default=1,
+        metadata={
+            "help": "Log DPO pair media every N epochs (1 = each epoch). Requires dpo_log_pair_media_enable.",
+        },
+    )
+    dpo_log_preference_candidate_media_enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If true (main process, DPO only), log (1) ``train/dpo_all_candidate_images``: per prompt, policy "
+                "rollout images then injected preference-clone panels (every rewarded clone), and (2) "
+                "``train/dpo_dataset_preference_candidate_images``: "
+                "a horizontal strip of every path listed under preference_candidate_metadata_key on disk; "
+                "requires preference_extra_candidates > 0. Reuses dpo_log_pair_media_max_pairs / "
+                "dpo_log_pair_media_every_epochs."
+            ),
+        },
+    )
+    dpo_log_preference_candidate_media_include_conditions: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When dpo_log_preference_candidate_media_enable: if true, prepend condition_images to "
+                "each ``train/dpo_all_candidate_images`` and ``train/dpo_dataset_preference_candidate_images`` strip "
+                "before rollout+preference panels / dataset paths (default false)."
+            ),
+        },
+    )
+    dpo_log_dataset_preference_candidate_path_index: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Unused by current loggers (reserved): dataset preference media concatenates all paths in "
+                "preference_candidate_metadata_key; kept for YAML backward compatibility."
+            ),
+        },
+    )
+
+    # Set in __post_init__ (must be a real field: @property + ArgABC.__getattr__ breaks attribute access)
+    preference_group_size: int = field(
+        init=False,
+        default=0,
+        metadata={
+            "help": (
+                "Samples per unique_id after preference injection: group_size + preference_extra_candidates."
+            ),
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
@@ -780,6 +1034,66 @@ class DPOTrainingArguments(TrainingArguments):
             self.num_train_timesteps = max(1, int(
                 self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])
             ))
+        if self.preference_extra_candidates < 0:
+            raise ValueError(
+                f"preference_extra_candidates must be non-negative, got {self.preference_extra_candidates!r}"
+            )
+        if not str(self.preference_candidate_metadata_key).strip():
+            raise ValueError("preference_candidate_metadata_key must be a non-empty string")
+        if self.sft_candidate_mode:
+            if self.preference_extra_candidates <= 0:
+                raise ValueError(
+                    "sft_candidate_mode=True requires preference_extra_candidates > 0"
+                )
+            if self.sft_candidate_weight <= 0.0:
+                raise ValueError(
+                    f"sft_candidate_weight must be positive when sft_candidate_mode=True, "
+                    f"got {self.sft_candidate_weight!r}"
+                )
+        if self.dpo_selection_rule_penalty < 0.0:
+            raise ValueError(
+                f"dpo_selection_rule_penalty must be non-negative, got {self.dpo_selection_rule_penalty!r}"
+            )
+        if self.dpo_condition_ssim_enable:
+            if not (0.0 < self.dpo_penalize_condition_ssim <= 1.0):
+                raise ValueError(
+                    f"dpo_penalize_condition_ssim must be in (0, 1], got {self.dpo_penalize_condition_ssim!r}"
+                )
+            if not (0.0 <= self.dpo_high_ssim_log_threshold < 1.0):
+                raise ValueError(
+                    f"dpo_high_ssim_log_threshold must be in [0, 1), got {self.dpo_high_ssim_log_threshold!r}"
+                )
+        if self.dpo_log_pair_media_enable:
+            if self.dpo_log_pair_media_max_pairs < 1:
+                raise ValueError(
+                    "dpo_log_pair_media_max_pairs must be >= 1 when dpo_log_pair_media_enable is True"
+                )
+            if self.dpo_log_pair_media_every_epochs < 1:
+                raise ValueError(
+                    "dpo_log_pair_media_every_epochs must be >= 1 when dpo_log_pair_media_enable is True"
+                )
+        if self.dpo_log_preference_candidate_media_enable:
+            if self.preference_extra_candidates <= 0:
+                raise ValueError(
+                    "dpo_log_preference_candidate_media_enable requires preference_extra_candidates > 0"
+                )
+            if self.dpo_log_pair_media_max_pairs < 1:
+                raise ValueError(
+                    "dpo_log_pair_media_max_pairs must be >= 1 when "
+                    "dpo_log_preference_candidate_media_enable is True "
+                    "(reused as max unique_id strips for preference candidates)"
+                )
+            if self.dpo_log_pair_media_every_epochs < 1:
+                raise ValueError(
+                    "dpo_log_pair_media_every_epochs must be >= 1 when "
+                    "dpo_log_preference_candidate_media_enable is True"
+                )
+            if self.dpo_log_dataset_preference_candidate_path_index < 0:
+                raise ValueError(
+                    "dpo_log_dataset_preference_candidate_path_index must be non-negative, got "
+                    f"{self.dpo_log_dataset_preference_candidate_path_index!r}"
+                )
+        self.preference_group_size = int(self.group_size) + int(self.preference_extra_candidates)
 
     @property
     def requires_ref_model(self) -> bool:

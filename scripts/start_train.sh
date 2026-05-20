@@ -55,7 +55,10 @@ CONFIG="${CONFIG:-/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/nft/lo
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/lora/flux2_klein_judge_frontier.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/full/flux2_klein_toolgen_judge_dpo.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/lora/flux2_klein_toolgen_judge_grpo.yaml
-CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo_preference_sim_vllm.yaml
+# CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo_preference_sim_frontier_warmstart.yaml
+CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_20k_dpo_sft_candidate.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/dpo/lora/flux2_klein_toolgen_judge_dpo.yaml
 # CONFIG=/primus_xpfs_workspace_T04/haozhe/Flow-Factory/examples/grpo/full/flux2_klein_judge_frontier.yaml
@@ -75,11 +78,15 @@ mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}" "${TRANSFORMERS_C
 if [[ "${SKIP_TRAIN_LOG:-0}" != "1" ]]; then
   TRAIN_LOG="${TRAIN_LOG:-${FLOW_CACHE_ROOT}/logs/train_ff_$(date +%Y%m%d_%H%M%S).log}"
   mkdir -p "$(dirname "${TRAIN_LOG}")"
+  # Create a stable symlink so the user can always find the current log
+  ln -sfn "${TRAIN_LOG}" "${FLOW_CACHE_ROOT}/logs/latest.log"
   if [[ "${TRAIN_LOG_TEE:-1}" == "1" ]]; then
     echo "[flow-factory] logging stdout+stderr to ${TRAIN_LOG} (and terminal)"
+    echo "[flow-factory] latest log symlink: ${FLOW_CACHE_ROOT}/logs/latest.log"
     exec > >(tee -a "${TRAIN_LOG}") 2>&1
   else
     echo "[flow-factory] logging stdout+stderr to ${TRAIN_LOG} (file only)" >&2
+    echo "[flow-factory] latest log symlink: ${FLOW_CACHE_ROOT}/logs/latest.log" >&2
     exec >>"${TRAIN_LOG}" 2>&1
   fi
 fi

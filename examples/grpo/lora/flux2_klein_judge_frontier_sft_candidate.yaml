@@ -1,0 +1,136 @@
+# GRPO + LoRA + SFT Candidate with ToolGen SearchBetter Frontier judge reward.
+#
+# Based on: examples/grpo/lora/flux2_klein_judge_frontier.yaml
+# Added: sft_candidate_mode — preference candidates from dataset metadata are excluded
+# from RL loss and trained with flow-matching velocity MSE (weight = sft_candidate_weight).
+#
+# Metrics: train/sft_diffusion_loss (unweighted MSE), train/policy_loss, train/loss.
+#
+# Dataset must have `dpo_preference_candidate_images` metadata column with one image path per row.
+
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  dataset_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/dataset/klein_i2i_visual_ge_35_v3"
+  enable_preprocess: false
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  cache_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/cached_datasets3"
+  max_dataset_size: 10240
+  sampler_type: "auto"
+
+model:
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "/primus_xpfs_workspace_T04/haozhe/gen_models/black-forest-labs/flux2-klein-4b-base"
+  model_type: "flux2-klein"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "swanlab"
+  save_dir: "/primus_xpfs_workspace_T04/haozhe/Flow-Factory/modeloutputs"
+  save_freq: 10
+  save_model_only: true
+
+train:
+  trainer_type: "grpo"
+  advantage_aggregation: "gdpo"
+
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: "v-based"
+  kl_beta: 0
+  ref_param_device: "cuda"
+
+  # SFT candidate mode
+  sft_candidate_mode: true
+  sft_candidate_weight: 0.3
+  preference_extra_candidates: 1
+  preference_candidate_metadata_key: "dpo_preference_candidate_images"
+
+  resolution: 512
+  condition_image_size: 512
+  num_inference_steps: 50
+  guidance_scale: 4.0
+
+  per_device_batch_size: 1
+  group_size: 16
+  global_std: false
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: auto
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+  seed: 42
+
+# Scheduler — same SDE knobs as examples/grpo/lora/flux2_klein_base/default.yaml
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.7
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+
+eval:
+  resolution: 512
+  condition_image_size: 512
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 50
+  eval_freq: 10
+  eval_dump_enable: false
+  eval_dump_subdir: "eval_results"
+  seed: 42
+
+rewards:
+  - name: "judge"
+    reward_model: "toolgen_searchbetter_judge_frontier"
+    weight: 1.0
+    batch_size: 16
+    device: "cpu"
+    dtype: bfloat16
+    toolgen_phase4_agent_dir: "/primus_xpfs_workspace_T04/haozhe/ToolGen/phase4_agent"
+    frontier_model_name: "doubao-seed-2.0-mini"
+    max_concurrent: 16
+    max_retries: 3
+    temperature: 0.2
+    max_tokens: 8000
+    max_pixels: 589824
+    frontier_max_total_pixels: 589824
+    variant: "training"
+    frontier_api_timeout: 300
+    frontier_judge_dump_dir: /primus_xpfs_workspace_T04/haozhe/Flow-Factory/.runtime_cache/frontier_judge_grpo_4b_sft_cand
+    toolgen_judge_unparsed_dump_dir: /primus_xpfs_workspace_T04/haozhe/Flow-Factory/.runtime_cache/frontier_judge_grpo_4b_sft_cand_unparsed
+    frontier_judge_error_policy: penalize
+    frontier_judge_penalty_value: 0.0
+    toolgen_judge_major_aspect_weights:
+      rubric_adaptive: 1.5
+      checklist: 1.5
+      prompt_faithfulness: 1.5
+      image_quality: 1.0
+      text_rendering: 2.5
+      ai_naturalness: 1.0
+      composition_and_aesthetics: 1.0
+      visual_reference_evaluation: 2.0
+      text_reference_evaluation: 1.0
